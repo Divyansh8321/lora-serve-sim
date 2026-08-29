@@ -39,8 +39,8 @@ FINDING -- THE KEY NEGATIVE RESULT OF THIS PROJECT:
 Run:  python phase3_cross_pool_signal.py
 """
 
-from mlora.core import make_multi_turn_workload
-from mlora.pools import (AdapterPool, KVPool, SeparatePoolSim,
+from core import make_multi_turn_workload
+from pools import (AdapterPool, KVPool, SeparatePoolSim,
                          NoComm, OneWayComm, CostAware, summarize)
 
 SEEDS = 5

@@ -22,7 +22,7 @@ Run:  python phase1_adapter_caching.py
 """
 
 from collections import deque
-from mlora.core import (ADAPTER_MB, DECODE_MS_PER_TOKEN, SWAP_COLD_MS, SWAP_WARM_MS,
+from core import (ADAPTER_MB, DECODE_MS_PER_TOKEN, SWAP_COLD_MS, SWAP_WARM_MS,
                         make_single_turn_workload, summarize)
 
 

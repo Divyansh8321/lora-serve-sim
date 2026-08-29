@@ -13,7 +13,7 @@ comparison isolates the eviction decision.
 
 from collections import deque
 
-from mlora.core import (ADAPTER_MB, MB_PER_TOKEN, PREFILL_MS_PER_TOKEN,
+from core import (ADAPTER_MB, MB_PER_TOKEN, PREFILL_MS_PER_TOKEN,
                         DECODE_MS_PER_TOKEN, SWAP_COLD_MS, SWAP_WARM_MS,
                         PCIE_MS_PER_MB, percentile)
 

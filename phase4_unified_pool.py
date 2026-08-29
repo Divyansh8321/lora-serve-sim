@@ -33,7 +33,7 @@ Run:  python phase4_unified_pool.py
 
 
 from collections import deque
-from mlora.core import (ADAPTER_MB, MB_PER_TOKEN, PREFILL_MS_PER_TOKEN,
+from core import (ADAPTER_MB, MB_PER_TOKEN, PREFILL_MS_PER_TOKEN,
                         DECODE_MS_PER_TOKEN, SWAP_COLD_MS,
                         make_multi_turn_workload, percentile)
 

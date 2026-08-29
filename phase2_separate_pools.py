@@ -25,8 +25,8 @@ FINDING: it exists, and it is large. With the adapter slab holding only 5 of 12
 Run:  python phase2_separate_pools.py
 """
 
-from mlora.core import make_multi_turn_workload
-from mlora.pools import AdapterPool, KVPool, SeparatePoolSim, NoComm, summarize
+from core import make_multi_turn_workload
+from pools import AdapterPool, KVPool, SeparatePoolSim, NoComm, summarize
 
 SEEDS = 5
 
