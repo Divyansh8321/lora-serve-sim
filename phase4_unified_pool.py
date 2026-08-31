@@ -10,23 +10,39 @@ WHY IT MATTERS: in phases 2-3 each pool had fixed, independent capacity, so
        cross-pool signal moved the staleness metric but not latency.
 
        Unification creates a decision that did not previously exist: which
-       TYPE to evict. And the two types differ by more than an order of
-       magnitude -- an adapter is ~20MB, a 2000-token conversation is ~250MB.
+       TYPE to evict. adapter = ADAPTER_MB (180, rank-32 all-linear -- ELORA's
+       rank); a multi-turn conversation here averages ~25MB and peaks ~250MB.
        Now the choice is worth making.
 
 QUESTION: once the pools are unified, how much does the eviction decision
        actually buy, and which part of the "smart" logic is doing the work?
 
-FINDING: 27% lower p50 at high pressure, with stale KV falling from ~46% to 0.
-       But the mechanism is simpler than expected. An uncoordinated policy
-       that merely checks KV BEFORE adapters performs identically to the full
-       dependency-aware policy at every pressure level tested -- because
-       evicting one 250MB conversation frees what a dozen adapter evictions
-       would, so the ordering alone avoids the thrash. The orphan-count and
-       stale-priority refinements never get exercised in this workload.
+FINDING (operating points scale with the ~2.7GB working set):
 
-       SO: unification is the enabler; ordering discipline captures nearly all
-       of the benefit; elaborate dependency scoring adds little on top.
+         pool MB   policy       p50    stale KV
+           3600    separate    1052      0.0%     (fits everything)
+           3600    kv-first    1052      0.0%
+           3600    joint       1052      0.0%
+           2500    separate    1053      2.2%
+           2500    kv-first    1052      0.0%
+           2500    joint       1052      0.0%
+           1600    separate    1127     21.9%     (constant eviction)
+           1600    kv-first    1045      0.0%
+           1600    joint       1045      0.0%
+
+       At the packed operating point: unification + KV-before-adapters
+       ordering gives -7.3% p50 and drives staleness to zero. kv-first
+       (crude ordering) == joint (full dependency-aware) exactly. The
+       orphan-count and stale-priority refinements never get exercised.
+
+       Phase 5 sharpens this under continuous batching + a squeezed unified
+       pool: kv-first there beats even the dependency-aware policy, because
+       the "smart" policy preserves KV it should have dropped.
+
+       SO: unification is the enabler; ordering discipline captures the
+       benefit; dependency scoring adds nothing here. Whether it adds
+       something once prefixes are SHARED (ELORA's regime) is phase 6 --
+       ELORA's own ELORA-WOM ablation says it should (1.51x TTFT).
 
 Run:  python phase4_unified_pool.py
 """
@@ -258,10 +274,15 @@ class Simulator:
 
 
 # --- named operating points (see README for justification) ---
+# The workload's full working set is ~12*ADAPTER_MB of adapters + ~1000 MB of
+# conversation KV. Operating points bracket that: over-provisioned fits
+# everything, aggressively-packed forces constant eviction. Derived from
+# ADAPTER_MB so they track the adapter size (rank-32 all-linear = 180 MB).
+_WORKING_SET = 12 * ADAPTER_MB + 1000
 OPERATING_POINTS = [
-    ("over-provisioned",   1200),
-    ("cost-optimised",      800),
-    ("aggressively-packed", 400),
+    ("over-provisioned",   round(_WORKING_SET * 1.15 / 100) * 100),
+    ("cost-optimised",     round(_WORKING_SET * 0.80 / 100) * 100),
+    ("aggressively-packed", round(_WORKING_SET * 0.50 / 100) * 100),
 ]
 SEEDS = 5
 

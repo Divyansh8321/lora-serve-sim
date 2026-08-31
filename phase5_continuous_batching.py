@@ -34,22 +34,29 @@ NEW CONSTRAINT -- adapter pinning:
   adapter would be the (max_loras+1)-th distinct adapter is not admitted until
   one drains.
 
-FINDING (mean over 5 seeds, KV pool 800MB, adapter 20MB):
+FINDING (mean over 5 seeds; adapter 180MB = core.ADAPTER_MB, rank-32
+all-linear, ELORA's rank; separate KV pool 4000MB):
 
-  SEPARATE pool, shrinking the adapter slab (max_loras 12 -> 3):
+  SEPARATE pool, shrinking the adapter slab (max_loras = adapters that fit):
     max_loras   p50    p95   TTFT p50   TPOT   stale KV   disk loads
        12       689   1076      22       17.0     0.0%        11
-        7       747   1531      24       19.6    13.6%        28
-        5       871   1957      29       23.1    27.5%        54
-        3      1170   2676     296       26.6    49.9%        88
+        7       747   1531      24       19.6    13.8%        28
+        5       871   1957      29       23.1    27.7%        54
+        3      1170   2676     296       26.6    50.1%        88
 
   The pathology reproduces on the realistic substrate -- 50% stale KV at
-  max_loras=3, bracketing ELORA's 42.4% (vLLM) / 48.6% (ELORA-WOM). But the
+  max_loras=3, bracketing ELORA's 42.4% (vLLM) / 48.6% (ELORA-WOM). The
   MECHANISM is now visible and it is a TIMING one: the sharp TTFT knee at
   max_loras=3 (22ms -> 296ms) is ADMISSION STALL -- a waiting request whose
   adapter would be the 4th distinct adapter in the batch cannot be spliced in
   until one of the 3 pinned adapters drains. Phases 2-4, being batch-at-a-time,
   produced the staleness NUMBER without this mechanism.
+
+  SCALE-INVARIANCE: these numbers are IDENTICAL at --adapter-mb 20, 90, and
+  180 for the same max_loras. The pathology depends on the RATIO of
+  adapters-that-fit to adapters-in-use, not the absolute MB. This is a useful
+  robustness result -- and it means the earlier ADAPTER_MB=20 phase-2..4
+  numbers were not wrong in shape, only mislabelled in units.
 
   TPOT rises 17 -> 27 as the slab shrinks: recompute-prefill of rebuilt stale
   KV competes for the per-step token budget with every decoder in the batch.
@@ -57,38 +64,35 @@ FINDING (mean over 5 seeds, KV pool 800MB, adapter 20MB):
   ELORA's stated reason for their 37.8% TPOT win.
 
   The cross-pool signal (phase 3) still fails on latency here. cost-aware
-  moves stale KV 27.5% -> 23.4% (or, under KV pressure, 17.3% -> 8.4%) but p50
-  moves by <1% -- noise. Slab capacity is still fixed and independent; the
-  signal changes WHICH adapter reloads, not how many.
+  moves stale KV 27.7% -> 24.2% but p50 moves by <1% -- noise. Slab capacity
+  is fixed and independent; the signal changes WHICH adapter reloads, not
+  how many.
 
-  UNIFIED pool (one 1000MB region), adapter 20MB: p50 stays 689 -> 706 across
-  the whole sweep, stale KV stays 0%. A big idle conversation's KV is traded
-  for an adapter slot mid-stream. Phase 4's headline, holding under continuous
-  batching. At 20MB adapters blind / kv-first / cost-aware are identical --
-  the phase-4 "ordering is enough" result.
+  UNIFIED pool, generously sized (4000MB): flat -- p50 689 -> 706, stale KV
+  0% across the whole sweep. A big idle conversation's KV is traded for an
+  adapter slot mid-stream. Phase 4's headline, under continuous batching.
 
-  NEW: that equivalence is partly an artifact of the 20MB adapter size. At
-  --adapter-mb 80 the unified pool shows kv-first clearly beating both blind
-  and cost-aware (p50 ~700 vs 760-840, stale 0% vs 11-21%): once an adapter is
-  no longer a pebble, "evict KV before adapters" stops being free and the
-  ordering rule earns its keep. So the phase-4 claim should read: ordering
-  discipline is what matters, and it matters MORE as the adapter/KV size gap
-  narrows. Whether dependency scoring beats plain ordering still needs prefix
-  sharing to test -- that is phase 6.
+  UNIFIED pool, squeezed (1800MB, ~0.65x working set) -- the interesting case:
+    max_loras   policy       p50   stale KV   kv recompute
+        3       blind        774     13.7%          7      (adapter-first order)
+        3       kv-first     724      0.3%         56      (KV-before-adapters)
+        3       cost-aware   779     11.5%          5      (dependency-aware)
+    kv-first wins on BOTH p50 (-6%) and staleness (~0) by trading 8x more KV
+    recompute -- which continuous batching absorbs into the step budget.
+    cost-aware (the "smart" one) does WORSE than kv-first: it preserves KV it
+    should have dropped. Naive ordering beats dependency scoring here.
+    Whether dependency scoring wins once prefixes are SHARED is phase 6.
 
-  With a CPU KV tier (--kv-cpu): recompute events drop ~3x (blocks demoted,
-  not dropped) while staleness is unchanged -- phase 2b's "cheaper not rarer",
-  reproduced.
-
-CALIBRATION NOTE: core.ADAPTER_MB = 20 is on the low side for a rank-16 LoRA on
-  an 8B model targeting all 7 projections (~60-90MB); 20MB is closer to
-  rank-8 attention-only. Adapter-slab pressure is this phase's x-axis, so
-  --adapter-mb lets you sweep 20/40/80 and check the pathology shape is
-  size-robust. core.py is left untouched so phases 1-4 stay on the record.
+  CPU KV tier (--kv-cpu): under continuous batching with these short
+  conversations, live-KV preemption is rare (most eviction hits already-stale
+  KV, which the CPU tier does not help). So phase 2b's "CPU tier makes
+  mistakes cheaper" effect is MUTED here -- an honest divergence from phases
+  2-4, caused by the execution model, not a bug. It would reappear with
+  longer conversations / tighter KV pools.
 
 Run:  python phase5_continuous_batching.py
-      python phase5_continuous_batching.py --pool unified --adapter-mb 40
-      python phase5_continuous_batching.py --pool separate --kv-gpu 250 --kv-cpu 400
+      python phase5_continuous_batching.py --pool unified --unified-cap 1800
+      python phase5_continuous_batching.py --pool separate --kv-gpu 500
 """
 
 import argparse
@@ -96,7 +100,7 @@ import math
 from collections import deque, OrderedDict
 
 from core import (MB_PER_TOKEN, PREFILL_MS_PER_TOKEN, DECODE_MS_PER_TOKEN,
-                  SWAP_COLD_MS, SWAP_WARM_MS, PCIE_MS_PER_MB,
+                  SWAP_COLD_MS, SWAP_WARM_MS, PCIE_MS_PER_MB, ADAPTER_MB,
                   make_multi_turn_workload, percentile)
 
 # --- step-loop constants ---
@@ -748,7 +752,7 @@ def build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu, cap, cpu,
 
 
 def trial(pool, max_loras, policy_name, seed, adapter_size,
-          kv_gpu_mb=800, adapter_cpu=0, kv_cpu=0, unified_cap=1000, unified_cpu=0):
+          kv_gpu_mb=4000, adapter_cpu=0, kv_cpu=0, unified_cap=4000, unified_cpu=0):
     convos, reqs = workload(seed)
     adapter_mb = max_loras * adapter_size
     cache = build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu,
@@ -788,15 +792,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pool", choices=["separate", "unified", "both"], default="both")
-    ap.add_argument("--adapter-mb", type=float, default=20.0,
-                    help="MB per adapter. core default 20 is low for rank-16/8B; "
-                         "try 40 or 80 to check the pathology is size-robust.")
+    ap.add_argument("--adapter-mb", type=float, default=float(ADAPTER_MB),
+                    help=f"MB per adapter. core.ADAPTER_MB={ADAPTER_MB} "
+                         f"(rank-32 all-linear, ELORA's rank). Sweep 20/90/180 "
+                         f"to check the pathology is size-robust.")
     ap.add_argument("--policy", default=None,
                     help="blind|signal|cost-aware|kv-first ; default sweeps a set")
-    ap.add_argument("--kv-gpu", type=float, default=800.0)
+    ap.add_argument("--kv-gpu", type=float, default=4000.0,
+                    help="separate-pool KV region MB (realistic single-GPU size)")
     ap.add_argument("--kv-cpu", type=float, default=0.0)
     ap.add_argument("--adapter-cpu", type=float, default=0.0)
-    ap.add_argument("--unified-cap", type=float, default=1000.0)
+    ap.add_argument("--unified-cap", type=float, default=4000.0,
+                    help="unified pool MB. Working set ~12*adapter + ~1000 KV.")
     ap.add_argument("--unified-cpu", type=float, default=0.0)
     ap.add_argument("--max-loras", type=int, nargs="+", default=[12, 7, 5, 3])
     args = ap.parse_args()

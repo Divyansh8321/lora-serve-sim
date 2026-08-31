@@ -9,7 +9,14 @@ import random
 
 # --- calibrated constants (see README for sources) ---
 MB_PER_TOKEN = 0.125      # 8B model, GQA, fp16: 2*32layers*8heads*128dim*2bytes
-ADAPTER_MB = 20           # rank-16 LoRA on an 8B model
+# ADAPTER_MB: rank-32 LoRA on Llama-3.1-8B, all 7 linear targets
+# (q,k,v,o,gate,up,down). Per-principles: 32 layers * [4*(4096*32+32*4096) +
+# 2*(4096*32+32*14336) + (14336*32+32*4096)] = 90.2M params * 2 bytes fp16
+# = 180 MB. ELORA (HPCA 2026) states "the ranks of LoRAs in our evaluations
+# are either 32 or 64", so this matches the architecture we compare against.
+# Earlier drafts used 20 MB (rank-8, q/v-only) -- a narrow-adapter regime;
+# phase 5's --adapter-mb sweeps 20/90/180 to show the pathology is size-robust.
+ADAPTER_MB = 180
 PREFILL_MS_PER_TOKEN = 0.15   # compute-bound, parallel across the prompt
 DECODE_MS_PER_TOKEN = 12      # bandwidth-bound, one full pass per token
 SWAP_COLD_MS = 300        # adapter load from disk / object storage

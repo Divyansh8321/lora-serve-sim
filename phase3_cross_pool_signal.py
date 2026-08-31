@@ -19,15 +19,28 @@ WORLD: same separate pools as phase 2. The ONLY change: before evicting an
 QUESTION: does the cheap signal recover the loss phase 2 measured?
 
 FINDING -- THE KEY NEGATIVE RESULT OF THIS PROJECT:
-       The signal works exactly as designed on the metric it targets: stale KV
-       falls from ~44% to ~13% (count-based) or ~5% (size-weighted).
-       BUT LATENCY DOES NOT IMPROVE. Across every pressure setting tested the
-       difference is within noise (+-3%), and sometimes negative.
+       The signal works on the metric it targets: stale KV falls (e.g. at the
+       3-fit slab, 44.7% -> 35.5% count-based, 34.0% size-weighted).
+       BUT LATENCY DOES NOT IMPROVE:
+
+         slab    policy      p50   vs blind   stale KV
+         7 fit   blind      1063        --       9.7%
+         7 fit   signal     1064     -0.1%       6.2%
+         7 fit   cost-aware 1072     -0.9%       5.6%
+         5 fit   blind      1134        --      23.1%
+         5 fit   signal     1185     -4.5%      16.0%
+         5 fit   cost-aware 1149     -1.3%      14.9%
+         3 fit   blind      1303        --      44.7%
+         3 fit   signal     1268     +2.7%      35.5%
+         3 fit   cost-aware 1367     -4.9%      34.0%
+
+       p50 wobbles +-5% around zero, frequently NEGATIVE. Every effect here is
+       smaller than seed-to-seed variance.
 
        WHY: in a separate-pool architecture the adapter slab's capacity is
        fixed and independent. Declining to evict adapter A means evicting
        adapter B instead -- so the TOTAL number of adapter reloads is
-       unchanged (~26-30 either way). The signal changes WHICH adapter pays
+       unchanged (~45-49 either way). The signal changes WHICH adapter pays
        the reload, not how many reloads happen. And stale KV is not destroyed:
        when its adapter returns, it is reused for free, so staleness is an
        opportunity cost on space, not a latency cost -- and space you free in
@@ -39,11 +52,15 @@ FINDING -- THE KEY NEGATIVE RESULT OF THIS PROJECT:
 Run:  python phase3_cross_pool_signal.py
 """
 
-from core import make_multi_turn_workload
+from core import make_multi_turn_workload, ADAPTER_MB
 from pools import (AdapterPool, KVPool, SeparatePoolSim,
                          NoComm, OneWayComm, CostAware, summarize)
 
 SEEDS = 5
+
+# slab sized in adapter slots, derived from ADAPTER_MB (see phase 2 / core.py)
+SLOTS_SWEEP = [7, 5, 3]
+KV_POOL_MB = 4000
 
 
 def trial(a_gpu, a_cpu, k_gpu, k_cpu, PolicyCls, seed):
@@ -63,19 +80,20 @@ def avg(a_gpu, a_cpu, k_gpu, k_cpu, PolicyCls):
 
 def main():
     print(__doc__)
-    print("Adapter slab squeezed; KV pool 800MB; no CPU tiers.\n")
-    print(f"{'slab':>6} {'policy':>11} {'p50':>7} {'latency vs blind':>17}"
+    print(f"Adapter slab squeezed; KV pool {KV_POOL_MB}MB; no CPU tiers.\n")
+    print(f"{'slab':>8} {'policy':>11} {'p50':>7} {'latency vs blind':>17}"
           f" {'stale KV':>10} {'disk loads':>11}")
-    print("-" * 66)
-    for a_gpu in [140, 100, 60]:
+    print("-" * 68)
+    for slots in SLOTS_SWEEP:
+        a_gpu = slots * ADAPTER_MB
         base = None
         for P in [NoComm, OneWayComm, CostAware]:
-            m = avg(a_gpu, 0, 800, 0, P)
+            m = avg(a_gpu, 0, KV_POOL_MB, 0, P)
             if base is None:
                 base = m['p50']
             delta = 100 * (base - m['p50']) / base
             shown = "  (baseline)" if P is NoComm else f"{delta:+16.1f}%"
-            print(f"{str(a_gpu)+'MB':>6} {P.name:>11} {m['p50']:>7.0f} {shown:>17}"
+            print(f"{str(slots)+' fit':>8} {P.name:>11} {m['p50']:>7.0f} {shown:>17}"
                   f" {m['stale']:>9.1f}% {m['disk']:>11.0f}")
         print()
     print("Staleness collapses. Latency does not move. Freed KV-pool space is")

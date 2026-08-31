@@ -44,7 +44,8 @@ vllm --version
 Need ≥12 distinct rank-16 LoRA adapters for one base model (the workload uses
 12 by default; more slots than the tightest `--max-loras` is the whole point).
 Pull from the Hub or train tiny throwaways — quality is irrelevant, only that
-each is ~20 MB (matches `ADAPTER_MB` in `core.py`).
+each is ~180 MB — rank-32, all-linear targets — matching `core.ADAPTER_MB` and
+ELORA's stated rank. (Rank-16 all-linear ≈ 90 MB; rank-8 q/v-only ≈ 17 MB.)
 
 ```bash
 export LORA_MODULES="lora0=/adapters/a0 lora1=/adapters/a1 ... lora11=/adapters/a11"

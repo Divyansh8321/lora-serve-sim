@@ -2,7 +2,7 @@
 
 The simulator side reuses phase 2's own trial() so the predicted curve is
 exactly what `python phase2_separate_pools.py` prints -- no reimplementation.
-Adapter slab MB = max_loras * ADAPTER_MB (20), matching how phase 2 sizes it.
+Adapter slab MB = max_loras * ADAPTER_MB, matching how phase 2 sizes it.
 
 The measured side reads the run_*.jsonl files that validation/workload.py
 wrote, one per (max_loras, seed).
@@ -31,7 +31,7 @@ from core import ADAPTER_MB  # noqa: E402
 from phase2_separate_pools import trial as phase2_trial  # noqa: E402
 from pools import NoComm  # noqa: E402
 
-KV_POOL_MB = 800   # phase 2 Part A default
+KV_POOL_MB = 4000   # phase 2 Part A default (rescaled with ADAPTER_MB=180)
 
 
 def predict(max_loras, seeds):

@@ -25,11 +25,12 @@ python -c "import vllm; print(vllm.__version__)"
 ## 3. Adapters
 
 You need several distinct LoRA adapters for one base model. Either pull existing
-ones from the Hub, or train N tiny throwaway adapters (rank 8-16, a few hundred
-steps each on any small dataset) — quality is irrelevant, only their memory
-footprint and identity matter.
+ones from the Hub, or train N tiny throwaway adapters (rank 32, all-linear
+targets, a few hundred steps each on any small dataset) — quality is irrelevant,
+only their memory footprint and identity matter.
 
-Verify each is ~20MB, matching `ADAPTER_MB` in `mlora/core.py`.
+Verify each is ~180 MB, matching `ADAPTER_MB` in `core.py` and ELORA's stated
+rank of 32/64.
 
 ## 4. Serve
 
@@ -38,7 +39,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
   --enable-lora \
   --max-loras 4 \
   --max-cpu-loras 8 \
-  --max-lora-rank 16 \
+  --max-lora-rank 32 \
   --gpu-memory-utilization 0.85 \
   --port 8000
 ```
