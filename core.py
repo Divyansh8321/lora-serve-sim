@@ -132,3 +132,58 @@ def make_multi_turn_workload(n_conversations=40, n_adapters=12, turns_per_convo=
             rid += 1
             turn_time += rng.expovariate(1.0 / turn_gap)
     return conversations, requests
+
+
+def make_prefix_sharing_workload(n_conversations=40, n_adapters=12,
+                                 turns_per_convo=5, skew=1.0, rate=0.0006,
+                                 mean_tokens=40, turn_gap=6000.0,
+                                 shared_prefix_tokens=0, shared_prefix_groups=3,
+                                 seed=0):
+    """Phase 6: like make_multi_turn_workload, but conversations are split into
+    `shared_prefix_groups` groups and every conversation in a group shares the
+    same first `shared_prefix_tokens` tokens -- a "system prompt" that a radix
+    prefix tree can match and reuse across users.
+
+    The prefix belongs to a (group, adapter) pair: two conversations only share
+    a prefix if they are in the same group AND use the same adapter, because a
+    LoRA rewrites the KV. This mirrors ELORA's tree, whose top layer is LoRAs
+    and whose prefix nodes hang inside a LoRA's subtree.
+
+    Adds to each Conversation:
+      .prefix_group   : int
+      .prefix_tokens  : int   (== shared_prefix_tokens, or 0)
+      .prefix_key     : (adapter_id, prefix_group) or None
+    Adds to each Request:
+      .is_first_turn  : bool  (only the first turn pays to build the prefix)
+
+    shared_prefix_tokens=0 reduces EXACTLY to make_multi_turn_workload's
+    request/timing structure (same seed -> same turns), so phase 6 at 0 is a
+    controlled baseline against phases 2-5.
+    """
+    rng = random.Random(seed)
+    weights = [1.0 / (r ** skew) for r in range(1, n_adapters + 1)]
+    adapter_ids = list(range(n_adapters))
+    rng.shuffle(adapter_ids)
+
+    conversations = []
+    requests = []
+    rid = 0
+    t = 0.0
+    for cid in range(n_conversations):
+        t += rng.expovariate(rate)
+        adapter = rng.choices(adapter_ids, weights=weights, k=1)[0]
+        convo = Conversation(adapter, cid)
+        convo.prefix_group = cid % shared_prefix_groups
+        convo.prefix_tokens = shared_prefix_tokens
+        convo.prefix_key = ((adapter, convo.prefix_group)
+                            if shared_prefix_tokens > 0 else None)
+        conversations.append(convo)
+        turn_time = t
+        for turn_idx in range(turns_per_convo):
+            tokens = max(10, int(rng.gauss(mean_tokens, mean_tokens * 0.3)))
+            r = Request(rid, cid, tokens, turn_time)
+            r.is_first_turn = (turn_idx == 0)
+            requests.append(r)
+            rid += 1
+            turn_time += rng.expovariate(1.0 / turn_gap)
+    return conversations, requests

@@ -29,23 +29,25 @@ python phase2_separate_pools.py      # + KV, separate pools (real vLLM architect
 python phase3_cross_pool_signal.py   # + one cross-pool signal   <- key negative result
 python phase4_unified_pool.py        # + unified pool (S-LoRA / ELORA-style)
 python phase5_continuous_batching.py # + continuous batching (real execution model)
+python phase6_radix_prefix.py        # + RadixAttention prefix tree + prefix sharing
 ```
 Pure standard library. No GPU, no model, no network.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
-`validation/README.md`. Phases 6–7 (see [Roadmap](#roadmap)) add the
-RadixAttention prefix tree and ELORA's cost-model swapper.
+`validation/README.md`. Phase 7 (see [Roadmap](#roadmap)) adds ELORA's
+100 ms cost-model swapper.
 
-## The four findings
+## The findings
 
 | phase | what changes | result |
 |---|---|---|
 | 1 | adapter cache only | **3-6% p50** cold swaps, **~0%** warm — the motivation, not a win |
 | 2 | + KV, **separate** pools | stale KV **0% → 44%** as the adapter slab shrinks; p50 +24%, disk loads 11 → 49 |
-| 3 | + cross-pool signal | stale KV **44% → 33%** (5% size-weighted), **latency unchanged (±3%)** |
-| 4 | + **unified** pool | **27%** lower p50, stale KV **46% → 0%**; ordering-only ≈ dependency-aware *in this workload* |
+| 3 | + cross-pool signal | stale KV **44% → 34%**, **latency unchanged (±5%, often negative)** |
+| 4 | + **unified** pool | at the packed point **−7% p50**, stale KV **22% → 0%**; ordering-only ≈ dependency-aware |
 | 5 | + **continuous batching** | pathology reproduces (50% stale KV) but is now **timing-driven** — a sharp TTFT knee from *admission stall*; new **TPOT channel** (17→27) from recompute-prefill; unified stays flat |
+| 6 | + **RadixAttention prefix tree** + prefix sharing | blind LRU-of-leaves **collapses** (p50 ×40) under sharing; prefix-aware **ordering** avoids it; ELORA-style **dependency scoring** adds a further **2–7%** on top — real, but far short of ELORA's claimed 1.51× |
 
 ### Phase 2 — the pathology is architectural, not incidental
 
@@ -105,25 +107,55 @@ performs *identically* to `joint` (full dependency-aware). The orphan-count and
 stale-priority refinements never get exercised in this workload.
 
 **This appears to contradict ELORA.** Their ELORA-WOM ablation (unified pool,
-dependency manager removed) is **1.51× worse TTFT** than full ELORA — i.e. for
-them, dependency-awareness matters a lot. The reconciliation is almost certainly
-*prefix sharing*: ELORA's dependency tree is a RadixAttention prefix tree, and
-their workloads (LMSYS-33K chat, Azure trace) have heavy cross-query prefix
-overlap. This simulator's workload has **none** — each conversation is
-independent — so "evict the biggest thing" is already near-optimal. The honest
-statement:
+dependency manager removed) is **1.51× worse TTFT** than full ELORA. The
+suspected reconciliation was *prefix sharing* — ELORA's dependency tree is a
+RadixAttention prefix tree, and their workloads (LMSYS-33K chat, Azure trace)
+have heavy cross-query prefix overlap that this workload lacks. **Phase 6 tests
+this directly** and the answer is nuanced — see below.
 
-**Unification is the enabler. In a workload without prefix sharing, ordering
-discipline captures nearly all of the benefit and dependency scoring adds
-little. Whether that survives prefix sharing is an open, testable question**
-(phase 6, the RadixAttention extension in the [Roadmap](#roadmap)).
+Phase 5 sharpens the pre-phase-6 picture: under continuous batching + a squeezed
+unified pool (1800 MB), `kv-first` beats *even the dependency-aware policy* —
+p50 724 vs 779, stale KV 0.3% vs 11.5% — because the "smart" policy preserves
+KV it should have dropped. It pays with 8× more KV recompute, which continuous
+batching absorbs into the step budget.
 
-Phase 5 sharpens this under continuous batching + a squeezed unified pool
-(1800 MB): `kv-first` there beats *even the dependency-aware policy* — p50 724
-vs 779, stale KV 0.3% vs 11.5% — because the "smart" policy preserves KV it
-should have dropped. `kv-first` pays for it with 8× more KV recompute, which
-continuous batching absorbs into the step budget. **Ordering discipline is what
-matters; dependency scoring without prefix sharing is worse than useless here.**
+### Phase 6 — does the prefix tree change the verdict?
+
+Phase 6 adds a **RadixAttention prefix tree** (KV keyed by token prefix, shared
+system-prompt nodes near the root, LoRA-rooted subtrees — ELORA's exact
+structure) and a workload where conversations share a system prompt. Three
+eviction policies, sweeping shared-prefix length on a generous 3000 MB pool:
+
+| prefix tokens | `ordering` p50 | `dep-aware` p50 | dep vs ordering | `lru-leaf` p50 |
+|---|---|---|---|---|
+| 0 | 689 | 689 | 0% | 689 |
+| 400 | 732 | 715 | **+2.2%** | 711 |
+| 800 | 842 | 785 | **+6.7%** | 884 |
+| 1600 | 1214 | 1160 | **+4.5%** | **28 553** |
+
+**Two results, and the smaller one is ELORA's:**
+
+1. **Prefix-*structure* awareness matters a lot.** `lru-leaf` — blind LRU over
+   leaves — collapses as the shared prefix grows (p50 ×40 at 1600 tokens): it
+   evicts shared prefix nodes that many sequences need, forcing everyone to
+   re-prefill. Any policy that doesn't blindly LRU-evict a shared node avoids
+   this — *including plain `ordering`*, which evicts biggest-single-node-first
+   (a shared prefix under an active adapter is neither the biggest node nor
+   unpinned).
+
+2. **The dependency *scoring* ELORA layers on top is worth ~2–7%.** `dep-aware`
+   (protect an adapter with live shared KV; evict widely-shared prefixes last)
+   beats `ordering` by 2–7% p50 and much better TTFT (38 vs 102 ms at 800
+   tokens). Real, consistent, grows with sharing — but nowhere near ELORA's
+   1.51×.
+
+**Reconciliation with ELORA-WOM.** ELORA-WOM removes the dependency manager
+*entirely* — it behaves like our `lru-leaf` (which does collapse ~40×), not
+like `ordering`. ELORA's paper never isolates "prefix-aware ordering, no
+dependency scoring", which is the cheap policy that captures most of the win.
+**Honest read: the pathology is real, prefix structure must be respected, but
+simple ordering discipline — not elaborate dependency scoring — does the heavy
+lifting.** Dependency scoring is a real but modest (~5%) refinement on top.
 
 ### Phase 5 — the pathology under the real execution model
 
@@ -216,20 +248,20 @@ is exactly `0.025` (40 GB/s) + `0.080` (10 µs dispatch per 128 KB).
 Things this project has *not* earned the right to claim yet, stated plainly so a
 reader can calibrate:
 
-1. **One workload.** Every phase 2–5 number is a single shape: 40 conversations,
-   12 adapters, Zipf skew 1.0, 5 turns, 6 s gaps, no prefix sharing. The
-   "ordering ≈ dependency-aware" result is workload-dependent and probably
-   *breaks* once conversations share prefixes (which is ELORA's regime) — phase 6.
-2. **Batch-at-a-time in phases 1–4.** Phase 5 adds continuous batching (rolling
-   batch, adapter pinning, `--max-loras` as a batch-composition limit) and shows
-   the pathology becomes *timing*-driven. Phases 1–4 keep the simpler model on
-   purpose — each isolates one variable — so their numbers stand in that frame.
+1. **One workload family.** Every number is one shape: 40 conversations, 12
+   adapters, Zipf skew 1.0, 5 turns, 6 s gaps. Phase 6 adds a shared-prefix
+   variant but the arrival/adapter structure is unchanged. No Azure-trace
+   burstiness, no drifting adapter popularity (both in ELORA's eval).
+2. **Batch-at-a-time in phases 1–4.** Phases 5–6 add continuous batching.
+   Phases 1–4 keep the simpler model on purpose — each isolates one variable.
 3. **The 60% rescue figure is an estimate.** Not measured in-sim.
 4. **Validation is a plan, not a result** until `validation/run_sweep.sh` has
-   actually run on a GPU. Once it does, compare against **phase 5**, not phase 2.
-5. **No prefix caching / RadixAttention.** ELORA's baseline vLLM has it on; we
-   have nothing. So our separate-pool gap partly *is* the "no prefix caching" gap.
-6. **Adapter size is now 180 MB** (rank-32, ELORA's rank) — corrected from an
+   actually run on a GPU. Once it does, compare against **phase 5/6**, not phase 2.
+5. **Phase 6's prefix tree is coarse.** KV is keyed by (adapter, group) at the
+   prefix and by cid for the continuation — no token-level radix matching, no
+   partial-prefix reuse. Enough for the eviction-policy question, not a
+   faithful RadixAttention.
+6. **Adapter size is 180 MB** (rank-32, ELORA's rank) — corrected from an
    earlier 20 MB. All phases re-run; separate-pool results are scale-invariant,
    unified-pool results got stronger (see Calibration).
 
@@ -238,8 +270,9 @@ reader can calibrate:
 | not modelled | what real systems do | planned? |
 |---|---|---|
 | continuous batching | one persistent rolling batch; adapters pinned to in-flight sequences | ✅ **phase 5** |
-| prefix caching / RadixAttention | SGLang/ELORA match longest shared prefix at any depth | **phase 6** |
+| prefix caching / RadixAttention | SGLang/ELORA match longest shared prefix at any depth | ✅ **phase 6** (coarse) |
 | cost-model swapper | ELORA re-scores every cache node every 100ms (swap cost + freq + LRU term) | **phase 7** |
+| bursty / drifting workload | Azure Function trace; adapter popularity shifts over time | **phase 7 prereq** |
 | reclaim pool | vLLM V1 frees blocks lazily; a request returning before reuse pays nothing | — |
 | remote KV tiers | LMCache backends: Redis/Valkey, Mooncake, NVMe, S3 | — |
 | multi-node routing | biggest real-world lever; invisible to a single-node model | — |
@@ -254,8 +287,8 @@ their real one". Full detail in `ROADMAP.md`.
 | phase | adds | why it matters | status |
 |---|---|---|---|
 | **5** | continuous batching (step clock, in-flight sequences, mid-stream admission, adapter pinning) | ELORA runs entirely under continuous batching; without it our staleness mechanism is structurally different from theirs | ✅ done — `phase5_continuous_batching.py` |
-| **6** | RadixAttention prefix tree (shared system prompts, longest-prefix match, per-node LRU) | ELORA's dependency manager *is* a prefix tree; this is the workload regime where dependency-awareness should start to beat plain ordering | ~2 days |
-| **7** | ELORA-style cost-model swapper (periodic re-scoring, `Eval_i` = swap cost + visit freq + `1−sigmoid(t)`) vs plain LRU | reproduces ELORA-WOS ablation; tests whether the cost model earns its 1.42× over LRU in our setting | ~1–2 days |
+| **6** | RadixAttention prefix tree (shared system prompts, LoRA-rooted subtrees, prefix-aware eviction) | ELORA's dependency manager *is* a prefix tree | ✅ done — `phase6_radix_prefix.py`. Result: blind LRU-of-leaves collapses; prefix-aware *ordering* fixes it; dependency *scoring* adds ~2–7% on top |
+| **7** | ELORA-style cost-model swapper (periodic re-scoring, `Eval_i` = swap cost + visit freq + `1−sigmoid(t)`) vs plain LRU | reproduces ELORA-WOS ablation; tests whether the cost model earns its 1.42× over LRU in our setting | next |
 
 ## References
 
