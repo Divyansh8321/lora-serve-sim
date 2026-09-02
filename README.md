@@ -2,24 +2,34 @@
 
 A discrete-event simulator for the memory problem in multi-tenant LoRA serving.
 One base model, many LoRA adapters, many concurrent multi-turn conversations,
-one GPU. Four phases, each isolating one variable.
+one GPU. **Seven phases**, each adding one variable, ending with a from-scratch
+reconstruction of ELORA's full architecture.
 
-**Headline:** the stale-KV pathology that motivates recent work (ELORA/FastLibra,
-HPCA 2026) is real and reproducible — but **fixing it with cross-pool
-coordination alone does not improve latency.** The two pools have to be able to
-trade capacity before coordination can pay off. Unification is the enabler;
-once unified, in *this* workload simple ordering discipline captures nearly all
-of the benefit — which is a claim about the workload as much as the mechanism
-(see [Scope & honesty](#scope--honesty)).
+**Headline.** The stale-KV pathology that motivates ELORA/FastLibra (HPCA 2026)
+is **real and reproducible** (we measure 44–50% invalid KV vs. their 42–49%).
+But decomposing their fix into levers their own ablations don't separate:
+
+- **Pool unification does the heavy lifting** (−7% p50, staleness → 0). A
+  cross-pool *signal* without unification moves the staleness metric but not
+  latency — capacity isn't fungible until the pools are merged.
+- **Prefix-structure-aware eviction *ordering* captures most of the rest.**
+  Blind LRU over a prefix tree collapses ~40× under shared prompts; a crude
+  "biggest-KV-first, adapters-last" rule already avoids that.
+- **The elaborate dependency *scoring* ELORA centres its design on is a real
+  but ~2–7% refinement** in these workloads — not the 51% its whole-vs-nothing
+  ablation implies.
+- **ELORA's 100 ms timer-driven cost-model swapper is net-negative here**
+  (−4% to −16% p50, worse under bursts) — on a single smaller GPU, reacting on
+  demand beats a proactive timer.
 
 **What ELORA actually claims** (paper, HPCA 2026 — not paraphrased from memory):
 a *unified caching pool* + a *dependency-aware cache manager* (a RadixAttention
-prefix tree whose nodes are LoRAs and KV blocks) + a *cost-model swapper* that
-re-scores every tree node every 100ms. Reported: **−45.7% TTFT**, **−37.8%
-TPOT**, **+78.9% peak load** vs vLLM. Stock vLLM suffers **42.4%** invalid KV;
-ELORA's own no-dependency-manager ablation (ELORA-WOM) still suffers **48.6%**.
-This simulator reproduces the pathology and isolates two configurations ELORA's
-ablation table skips — see below.
+prefix tree whose nodes are LoRAs and KV blocks) + a *100 ms cost-model swapper*.
+Reported: **−45.7% TTFT**, **−37.8% TPOT**, **+78.9% peak load** vs vLLM. Stock
+vLLM suffers **42.4%** invalid KV; ELORA's own no-dependency-manager ablation
+(ELORA-WOM) still suffers **48.6%**; LRU-instead-of-cost-model (ELORA-WOS) is
+1.42× worse TTFT. This simulator reproduces the pathology and isolates the
+configurations ELORA's ablation table skips — see below.
 
 ## Run
 
@@ -30,13 +40,14 @@ python phase3_cross_pool_signal.py   # + one cross-pool signal   <- key negative
 python phase4_unified_pool.py        # + unified pool (S-LoRA / ELORA-style)
 python phase5_continuous_batching.py # + continuous batching (real execution model)
 python phase6_radix_prefix.py        # + RadixAttention prefix tree + prefix sharing
+python phase7_cost_swapper.py        # + ELORA's 100ms cost-model swapper, bursty traffic
 ```
 Pure standard library. No GPU, no model, no network.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
-`validation/README.md`. Phase 7 (see [Roadmap](#roadmap)) adds ELORA's
-100 ms cost-model swapper.
+`validation/README.md`. **All 7 phases are built** — phases 5–7 progressively
+match ELORA's real execution model so the comparison is like-for-like.
 
 ## The findings
 
@@ -48,6 +59,7 @@ Pure standard library. No GPU, no model, no network.
 | 4 | + **unified** pool | at the packed point **−7% p50**, stale KV **22% → 0%**; ordering-only ≈ dependency-aware |
 | 5 | + **continuous batching** | pathology reproduces (50% stale KV) but is now **timing-driven** — a sharp TTFT knee from *admission stall*; new **TPOT channel** (17→27) from recompute-prefill; unified stays flat |
 | 6 | + **RadixAttention prefix tree** + prefix sharing | blind LRU-of-leaves **collapses** (p50 ×40) under sharing; prefix-aware **ordering** avoids it; ELORA-style **dependency scoring** adds a further **2–7%** on top — real, but far short of ELORA's claimed 1.51× |
+| 7 | + **ELORA's 100 ms cost-model swapper** + bursty/drifting traffic | the timer-driven swapper is **net-negative** here (−4% to −16% p50, worse as bursts intensify) — proactive swap-out churns; **react-on-demand wins**. Opposite of ELORA's "−1.42× without it" |
 
 ### Phase 2 — the pathology is architectural, not incidental
 
@@ -198,6 +210,47 @@ sweep — a big idle conversation's KV is traded for an adapter slot mid-stream.
 Phase 4's headline, holding under continuous batching. The phase-3 negative
 result also holds: `cost-aware` moves stale KV 27.7% → 24.2% but p50 by <1%.
 
+### Phase 7 — does ELORA's timer-driven swapper help?
+
+ELORA's third component: instead of evicting only when memory fills, a swapper
+runs every **100 ms**, re-scores every cache node with a cost model
+(`Eval_i` = swap-cost + frequency + soft-recency + a "keep enough LoRAs" floor),
+proactively evicts low-scored nodes above a high-water mark, and **prefetches**
+during idle windows. ELORA's ablation: replace it with plain LRU and TTFT gets
+**1.42× worse**.
+
+This needs bursty traffic to matter, so phase 7 adds `make_bursty_workload`:
+inhomogeneous Poisson arrivals (5–10× rate spikes) and a Zipf popularity
+ranking that re-shuffles every 60 s. On a 2400 MB pool, 400-token shared
+prefix:
+
+| workload | `react-lru` p50 | `react-dep` p50 | `swap-full` p50 | swapper vs react-lru |
+|---|---|---|---|---|
+| steady | 753 | 745 | 781 | **−3.7%** |
+| burst ×5 | 877 | 845 | 981 | **−11.8%** |
+| burst ×10 | 1497 | 1460 | 1731 | **−15.6%** |
+
+**The timer-driven swapper is net-negative here — and worse as bursts
+intensify. The opposite of ELORA's claim.** The proactive swap-out is churn:
+it evicts entries at 92% fill that are needed again seconds later, so adapter
+loads climb (14 → 34 vs 14 → 23 for `react-lru`). `swap-noprefetch` is worse
+still (−17.8% at ×5), confirming the proactive *swap-out* is the harmful part;
+prefetch fires only 5–6 times and doesn't offset it. Term ablations
+(`swap-wo-freq`, `swap-wo-swap`) move <0.3% — no single term carries anything
+because the whole approach is net-negative in this regime.
+
+**`react-dep`** — phase 6's dependency-aware eviction with *no timer* — is the
+consistent winner (+1% to +4% over `react-lru` across every config: tight pool,
+long prefix, fast drift).
+
+**Reconciliation with ELORA-WOS's 1.42×:** same pattern as every other phase.
+ELORA-WOS keeps the proactive timer + prefetch scaffolding and only swaps the
+*scoring* for LRU; our `react-lru` has no timer at all. ELORA's H800 has 8×
+our PCIe bandwidth and 80 GB HBM, so aggressive proactive swapping churns far
+more cheaply there, and their Azure-trace bursts may have the long idle windows
+prefetch needs. **On a single smaller GPU with tight memory, reacting on demand
+beats a 100 ms timer.**
+
 ## Calibration
 
 | constant | value | basis |
@@ -271,8 +324,8 @@ reader can calibrate:
 |---|---|---|
 | continuous batching | one persistent rolling batch; adapters pinned to in-flight sequences | ✅ **phase 5** |
 | prefix caching / RadixAttention | SGLang/ELORA match longest shared prefix at any depth | ✅ **phase 6** (coarse) |
-| cost-model swapper | ELORA re-scores every cache node every 100ms (swap cost + freq + LRU term) | **phase 7** |
-| bursty / drifting workload | Azure Function trace; adapter popularity shifts over time | **phase 7 prereq** |
+| cost-model swapper | ELORA re-scores every cache node every 100ms (swap cost + freq + LRU term) | ✅ **phase 7** |
+| bursty / drifting workload | Azure Function trace; adapter popularity shifts over time | ✅ **phase 7** (`make_bursty_workload`) |
 | reclaim pool | vLLM V1 frees blocks lazily; a request returning before reuse pays nothing | — |
 | remote KV tiers | LMCache backends: Redis/Valkey, Mooncake, NVMe, S3 | — |
 | multi-node routing | biggest real-world lever; invisible to a single-node model | — |
@@ -288,7 +341,7 @@ their real one". Full detail in `ROADMAP.md`.
 |---|---|---|---|
 | **5** | continuous batching (step clock, in-flight sequences, mid-stream admission, adapter pinning) | ELORA runs entirely under continuous batching; without it our staleness mechanism is structurally different from theirs | ✅ done — `phase5_continuous_batching.py` |
 | **6** | RadixAttention prefix tree (shared system prompts, LoRA-rooted subtrees, prefix-aware eviction) | ELORA's dependency manager *is* a prefix tree | ✅ done — `phase6_radix_prefix.py`. Result: blind LRU-of-leaves collapses; prefix-aware *ordering* fixes it; dependency *scoring* adds ~2–7% on top |
-| **7** | ELORA-style cost-model swapper (periodic re-scoring, `Eval_i` = swap cost + visit freq + `1−sigmoid(t)`) vs plain LRU | reproduces ELORA-WOS ablation; tests whether the cost model earns its 1.42× over LRU in our setting | next |
+| **7** | ELORA-style 100 ms cost-model swapper + idle prefetch, bursty/drifting workload | reproduces ELORA-WOS ablation | ✅ done — `phase7_cost_swapper.py`. Result: the timer-driven swapper is net-negative here (−4% to −16%); react-on-demand wins; `react-dep` (phase 6, no timer) is best |
 
 ## References
 

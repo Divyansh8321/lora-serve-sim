@@ -187,3 +187,86 @@ def make_prefix_sharing_workload(n_conversations=40, n_adapters=12,
             rid += 1
             turn_time += rng.expovariate(1.0 / turn_gap)
     return conversations, requests
+
+
+def make_bursty_workload(n_conversations=60, n_adapters=12, turns_per_convo=5,
+                         skew=1.0, base_rate=0.0006, mean_tokens=40,
+                         turn_gap=6000.0, shared_prefix_tokens=0,
+                         shared_prefix_groups=3,
+                         burst_factor=5.0, burst_period=40000.0,
+                         burst_duty=0.25, popularity_drift_period=60000.0,
+                         seed=0):
+    """Phase 7: bursty arrivals + drifting adapter popularity.
+
+    ELORA drives arrivals from the Microsoft Azure Function trace -- bursty,
+    heavy-tailed, with the hot set of LoRAs shifting over time. A steady
+    Poisson + fixed Zipf (phases 2-6) never stresses the two things ELORA's
+    cost-model swapper is FOR: prefetching during lulls, and re-scoring as the
+    hot set moves. This generator adds both, minimally.
+
+    Arrivals: an inhomogeneous Poisson process. The instantaneous rate is
+      base_rate * burst_factor   during a burst  (fraction burst_duty of each
+                                                  burst_period window)
+      base_rate                  otherwise
+    Conversation START times are drawn from this; turns within a conversation
+    still use turn_gap think-time.
+
+    Popularity drift: every popularity_drift_period ms the Zipf ranking of
+    adapters is re-shuffled, so an adapter that was rank-1 (hottest) can drop
+    to rank-8. A conversation's adapter is sampled from whatever ranking is
+    current at its start time.
+
+    shared_prefix_tokens works as in make_prefix_sharing_workload.
+
+    With burst_factor=1.0 and popularity_drift_period=inf this reduces to a
+    prefix-sharing workload with Poisson arrivals (not byte-identical to
+    make_prefix_sharing_workload -- different n_conversations default -- but
+    the same structure).
+    """
+    rng = random.Random(seed)
+    adapter_ids = list(range(n_adapters))
+
+    def ranking_at(t):
+        """Zipf weights over adapter_ids, re-shuffled each drift period."""
+        epoch = int(t // popularity_drift_period) if popularity_drift_period > 0 else 0
+        r = random.Random(seed * 100003 + epoch)
+        order = adapter_ids[:]
+        r.shuffle(order)
+        weights = [1.0 / (k ** skew) for k in range(1, n_adapters + 1)]
+        return order, weights
+
+    def rate_at(t):
+        if burst_period <= 0 or burst_factor <= 1.0:
+            return base_rate
+        phase = (t % burst_period) / burst_period
+        return base_rate * burst_factor if phase < burst_duty else base_rate
+
+    conversations = []
+    requests = []
+    rid = 0
+    t = 0.0
+    for cid in range(n_conversations):
+        # thin an inhomogeneous Poisson process: step with the max rate,
+        # accept a point with prob rate_at(t)/max_rate
+        max_rate = base_rate * max(1.0, burst_factor)
+        while True:
+            t += rng.expovariate(max_rate)
+            if rng.random() <= rate_at(t) / max_rate:
+                break
+        order, weights = ranking_at(t)
+        adapter = rng.choices(order, weights=weights, k=1)[0]
+        convo = Conversation(adapter, cid)
+        convo.prefix_group = cid % shared_prefix_groups
+        convo.prefix_tokens = shared_prefix_tokens
+        convo.prefix_key = ((adapter, convo.prefix_group)
+                            if shared_prefix_tokens > 0 else None)
+        conversations.append(convo)
+        turn_time = t
+        for turn_idx in range(turns_per_convo):
+            tokens = max(10, int(rng.gauss(mean_tokens, mean_tokens * 0.3)))
+            r = Request(rid, cid, tokens, turn_time)
+            r.is_first_turn = (turn_idx == 0)
+            requests.append(r)
+            rid += 1
+            turn_time += rng.expovariate(1.0 / turn_gap)
+    return conversations, requests
