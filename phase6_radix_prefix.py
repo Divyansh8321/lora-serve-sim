@@ -48,6 +48,18 @@ FINDING (mean over 5 seeds, adapter 180MB, 3 prefix groups):
        800       dep-aware    785      38        0.0%       +6.7%
       1600       ordering    1214     277        0.4%
       1600       dep-aware   1160     220        0.1%       +4.5%
+      3200       ordering    5583    2061        4.0%
+      3200       dep-aware   5327    1837        3.4%       +4.6%
+      6400       ordering   39747   36007        4.0%
+      6400       dep-aware  39737   36007        3.9%       +0.0%
+
+  The dependency-aware advantage is a MID-RANGE effect. It needs the shared
+  prefix big enough to matter (>400 tok) but small enough that keeping it
+  resident is FEASIBLE (roughly <10% of pool). At 6400 tok / 800MB on a
+  3000MB pool, neither policy can hold the prefix -- the system thrashes
+  (p50 ~40s, 36k recomputes) and dep-aware == ordering because there is no
+  good decision left to make. Outside the band -- too small to matter, or
+  too big to save -- the sophisticated policy earns nothing.
 
   TWO results, and the smaller one is ELORA's:
 
