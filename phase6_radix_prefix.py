@@ -90,15 +90,28 @@ FINDING (mean over 5 seeds, adapter 180MB, 3 prefix groups):
   +0.6-2.7% because eviction is so frequent all policies thrash. lru-leaf
   still collapses.
 
+HARDWARE PROFILE (--hw): phase 6 has no CPU/PCIe KV path, so --hw only moves
+  decode/prefill/swap-cold/adapter. At --hw elora-aggressive the dep-aware vs
+  ordering gap SHRINKS (800 tok: +6.7% -> +2.2%): faster compute makes the
+  recompute penalty that dep-aware avoids cheaper, so protecting shared
+  prefixes matters less. lru-leaf still degrades under sharing but less
+  catastrophically (315 -> 271 at 800 tok, vs 884 -> 785 at --hw ours).
+  Reading: dependency-scoring's value is INVERSELY related to hardware speed
+  -- another reason ELORA's 1.51x (measured on H800) does not transfer to a
+  slower single GPU as a policy claim.
+
 Run:  python phase6_radix_prefix.py
+      python phase6_radix_prefix.py --hw elora-aggressive --prefix-tokens 0 400 800
       python phase6_radix_prefix.py --prefix-tokens 0 400 800 1600 --pool-mb 3000
 """
 
 import argparse
 from collections import deque
 
+from dataclasses import replace as _replace
 from core import (MB_PER_TOKEN, PREFILL_MS_PER_TOKEN, DECODE_MS_PER_TOKEN,
-                  SWAP_COLD_MS, ADAPTER_MB, make_prefix_sharing_workload,
+                  SWAP_COLD_MS, ADAPTER_MB, HardwareProfile, OURS, get_profile,
+                  make_prefix_sharing_workload,
                   percentile)
 
 STEP_TOKEN_BUDGET = 512
@@ -391,7 +404,13 @@ POLICIES = {p.name: p for p in [LRULeaf, OrderingOnly, DepAware]}
 
 class RadixSim:
     def __init__(self, requests, conversations, pool_mb, policy, max_loras,
-                 prefix_tokens):
+                 prefix_tokens, hw=OURS):
+        hw = get_profile(hw)
+        self.hw = hw
+        self.adapter_mb = hw.adapter_mb
+        self.prefill_ms_per_token = hw.prefill_ms_per_token
+        self.decode_ms_per_token = hw.decode_ms_per_token
+        self.swap_cold_ms = hw.swap_cold_ms
         self.pool_mb = pool_mb
         self.policy = policy
         self.max_loras = max_loras
@@ -473,12 +492,12 @@ class RadixSim:
     def ensure_adapter(self, a):
         if a in self.adapters_mb:
             return 0.0
-        self.make_room(ADAPTER_MB)
-        if self.free_mb() < ADAPTER_MB - 1e-9:
+        self.make_room(self.adapter_mb)
+        if self.free_mb() < self.adapter_mb - 1e-9:
             return 0.0
-        self.adapters_mb[a] = ADAPTER_MB
+        self.adapters_mb[a] = self.adapter_mb
         self.adapter_loads += 1
-        return SWAP_COLD_MS
+        return self.swap_cold_ms
 
     # ---------- scheduling ----------
     def schedule(self):
@@ -588,7 +607,7 @@ class RadixSim:
                 # pinned by an (empty) batch -- and count the stall in its
                 # latency by advancing a step's worth of time.
                 swap_ms += self._force_admit_oldest()
-                self.now += FIXED_STEP_MS + DECODE_MS_PER_TOKEN + swap_ms
+                self.now += FIXED_STEP_MS + self.decode_ms_per_token + swap_ms
                 if not self.batch:
                     # still impossible (pool < one adapter): drop it, unserved
                     r = self.waiting.popleft()
@@ -610,8 +629,8 @@ class RadixSim:
                     s.phase = "decode"
 
         step_ms = (FIXED_STEP_MS + PER_SEQ_STEP_MS * len(self.batch)
-                   + DECODE_MS_PER_TOKEN
-                   + prefill_this_step * PREFILL_MS_PER_TOKEN
+                   + self.decode_ms_per_token
+                   + prefill_this_step * self.prefill_ms_per_token
                    + swap_ms)
         self.now += step_ms
         self.steps += 1
@@ -666,13 +685,13 @@ SEEDS = 5
 
 
 def trial(prefix_tokens, policy_name, seed, pool_mb, max_loras=5,
-          groups=3):
+          groups=3, hw="ours"):
     convos, reqs = make_prefix_sharing_workload(
         n_conversations=40, n_adapters=12, turns_per_convo=5, mean_tokens=40,
         rate=0.0006, turn_gap=6000, shared_prefix_tokens=prefix_tokens,
         shared_prefix_groups=groups, seed=seed)
     sim = RadixSim(reqs, convos, pool_mb, POLICIES[policy_name](),
-                   max_loras, prefix_tokens)
+                   max_loras, prefix_tokens, hw=hw)
     sim.run()
     lats = [r.latency() for r in sim.finished]
     ttfts = list(sim.ttft.values())
@@ -708,11 +727,27 @@ def main():
                          "'interesting case'), where ordering beat dep-aware.")
     ap.add_argument("--max-loras", type=int, default=5)
     ap.add_argument("--groups", type=int, default=3)
+    ap.add_argument("--hw", default="ours",
+                    choices=["ours", "elora", "elora-aggressive", "elora-conservative"],
+                    help="hardware profile (see core.py). Phase 6 has no CPU/PCIe "
+                         "KV path, so --hw moves decode/prefill/swap-cold/adapter.")
+    ap.add_argument("--decode-ms-per-token", type=float, default=None)
+    ap.add_argument("--prefill-ms-per-token", type=float, default=None)
+    ap.add_argument("--swap-cold-ms", type=float, default=None)
     args = ap.parse_args()
+
+    hw = get_profile(args.hw)
+    _ov = {}
+    if args.decode_ms_per_token is not None: _ov["decode_ms_per_token"] = args.decode_ms_per_token
+    if args.prefill_ms_per_token is not None: _ov["prefill_ms_per_token"] = args.prefill_ms_per_token
+    if args.swap_cold_ms is not None: _ov["swap_cold_ms"] = args.swap_cold_ms
+    if _ov:
+        hw = _replace(hw, **_ov)
 
     print(__doc__)
     print(f"unified pool {args.pool_mb:.0f}MB | max_loras {args.max_loras} | "
-          f"{args.groups} prefix groups | adapter {ADAPTER_MB}MB | "
+          f"{args.groups} prefix groups | hw={hw.name} "
+          f"decode={hw.decode_ms_per_token:.2f} | adapter {hw.adapter_mb:.0f}MB | "
           f"mean of {SEEDS} seeds\n")
     print(f"{'prefix tok':>10} {'policy':>10} {'p50':>8} {'p95':>9} {'TTFT p50':>9}"
           f" {'TPOT':>7} {'stale KV':>9} {'reuse%':>8} {'ldrs':>6}")
@@ -721,7 +756,7 @@ def main():
         base = None
         for pol in ["lru-leaf", "ordering", "dep-aware"]:
             m = avg(prefix_tokens=pt, policy_name=pol, pool_mb=args.pool_mb,
-                    max_loras=args.max_loras, groups=args.groups)
+                    max_loras=args.max_loras, groups=args.groups, hw=hw)
             if pol == "ordering":
                 base = m["p50"]
             tag = ""

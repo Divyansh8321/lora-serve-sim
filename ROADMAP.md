@@ -273,6 +273,26 @@ class CostModelSwapper:
 - if it doesn't reproduce: say so, and name the workload feature we're missing
   (most likely the Azure-trace burstiness — see below)
 
+### Status: DONE — `phase7_cost_swapper.py`
+
+Result: the timer-driven swapper is **net-negative at our engine model**
+(sync swap, charged prefetch, proactive evict-at-92%): −5% to −22% p50, worse
+under bursts. **At ELORA's engine model** (`--hw elora`: async CUDA-stream
+swap, overlapped prefetch, evict-on-full) it **flips to +0.4% to +2.9%**. The
+`--sweep` attribution isolates the single responsible change: `--swap-out-when
+full` — a *policy* choice, not a hardware constant. `--sweep-const` confirms no
+hardware constant alone flips it. `react-dep` (phase-6 eviction, no timer) is
+the consistent winner at both engines.
+
+### Phase 7b — hardware-profile sweep (DONE, folded into phase 7)
+
+`core.HardwareProfile` + `OURS` / `ELORA_AGGRESSIVE` / `ELORA_CONSERVATIVE`.
+Phases 5–7 take `--hw`; phase 7 adds `--swap-mode`, `--prefetch-cost`,
+`--swap-out-when` (each a standalone switch), `--sweep` (switch attribution
+grid), `--sweep-const` (single-constant crossover), and `sweeps/*.py`
+standalone artifacts. Phase 5: pathology is HW-robust (fit-ratio effect).
+Phase 6: dependency-scoring's value *shrinks* at faster HW.
+
 ---
 
 ## Cross-cutting: workload realism
@@ -307,10 +327,11 @@ under burstiness, that itself is the finding — and it matches ELORA's framing
 3. **Phase 6** (prefix tree) — resolves the open question in the phase-4 caveat.
    Checkpoint: a yes/no on "does dependency-awareness beat ordering under
    sharing".
-4. **Phase 7** (cost swapper) — reproduces ELORA's last two ablations.
-   Checkpoint: does the cost model beat LRU here, and which term matters.
+4. **Phase 7** (cost swapper + `--hw` profiles) — DONE. The swapper is
+   net-negative at our engine, net-positive at ELORA's; `--swap-out-when full`
+   (a policy choice) carries the flip, not any hardware constant.
 5. **GPU validation run** — once phase 5 exists, run `validation/run_sweep.sh`
-   and compare against phase 5, not phase 2.
+   and compare against phase 5, not phase 2. Still pending real hardware.
 
 Each checkpoint is a commit + a docstring finding in the house style. No phase
 merges into a claim in the README until its checkpoint statement is written.

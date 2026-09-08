@@ -11,12 +11,32 @@ WORLD: phase 6's substrate -- unified pool, continuous batching, radix prefix
                   + w_floor * enough_loras_term       (don't evict so many
                                                        LoRAs everything cold-starts)
        and evicts lowest-Eval leaves down to a low-water mark.
-       When memory is IDLE, it PREFETCHES: pulls in adapters / KV it predicts
-       will be needed soon, paying the cold-start before the request lands.
+       When memory is IDLE, it PREFETCHES the adapter for the soonest upcoming
+       (adapter, group), paying the cold-start before the request lands.
 
        ELORA's ablation: replace the whole thing with plain LRU (ELORA-WOS)
        -> 1.42x worse TTFT. So they claim the timer + cost model is nearly as
        important as the dependency manager.
+
+HARDWARE PROFILE (--hw, see core.py). ELORA's swapper is built for ELORA's
+       engine: transfers overlap inference on CUDA streams ("no extra swapping
+       overhead", VII), and it swaps OUT only "when full", swaps IN below 70%
+       util (VI-C). Our model's defaults are the opposite -- synchronous swap
+       cost, proactive swap-out at 92% fill -- so an apples-to-apples test must
+       align the ENGINE, not just the constants. Three switches, each also a
+       standalone flag for one-at-a-time attribution:
+         --swap-mode {sync,async}       async: adapter transfer does not stall
+                                        the step; the request that needs it is
+                                        deferred until _adapter_ready.
+         --prefetch-cost {charged,overlapped}   charged (our default): the
+                                        prefetch copy costs wall time (folded
+                                        into the next step -- honest for sync
+                                        HW). overlapped: runs on a stream, free.
+         --swap-out-when {full,highwater}   full: the 100ms timer only
+                                        prefetches; make_room() still evicts
+                                        reactively on demand. NO proactive churn.
+       `--hw elora[-aggressive|-conservative]` sets async + overlapped + full
+       together (plus PCIe/HBM constants).
 
 WHY A BURSTY WORKLOAD: the swapper only helps under bursts + drift. Steady
        Poisson + fixed Zipf (phases 2-6) never gives it a lull to prefetch in
@@ -36,55 +56,80 @@ QUESTION: on a bursty, drifting workload, does the timer + cost model beat
        react-on-full, and by how much -- and which term carries it? Does it
        reproduce ELORA's ~1.4x, or is it a smaller effect here too?
 
-FINDING (mean over 5 seeds, pool 2400MB, prefix 400 tok, 60s drift):
+FINDING (mean over 5 seeds, pool 2400MB, prefix 400 tok, 60s drift).
+
+  AT OUR ENGINE (--hw ours: sync swap, prefetch charged, proactive swap-out):
 
     workload    react-lru  react-dep  swap-full   swap vs react-lru
-    STEADY         753        745        781           -3.7%
-    BURST x5       877        845        981          -11.8%
-    BURST x10     1497       1460       1731          -15.6%
+    STEADY         753        745        788           -4.7%
+    BURST x5       877        845       1029          -17.4%
+    BURST x10     1497       1460       1820          -21.6%
 
-  THE TIMER-DRIVEN COST MODEL MAKES THINGS WORSE HERE -- and progressively
-  worse as bursts intensify. This is the OPPOSITE of ELORA's claim that
-  removing it costs 1.42x TTFT.
+  The timer-driven cost model makes things WORSE, progressively so as bursts
+  intensify -- the opposite of ELORA's "1.42x without it". WHY: the proactive
+  swap-OUT at 92% fill is pure churn -- it evicts entries needed again seconds
+  later, so adapter loads climb 14 -> 28 -> 38 (swap-full) vs 14 -> 23
+  (react-lru). (Earlier drafts showed -3.7/-11.8/-15.6 here; the current, more
+  negative numbers are honest -- prefetch used to be modelled as free; it now
+  costs wall time under --prefetch-cost charged.)
 
-  WHY: the proactive swap-OUT at high-water is pure churn. It evicts entries
-  at 92% fill that are needed again seconds later. Adapter loads climb
-  14 -> 25 -> 34 (swap-full) vs 14 -> 23 (react-lru). It pays reload cost to
-  free memory that reactive eviction would have freed only on demand.
+  AT ELORA'S ENGINE (--hw elora: async swap, prefetch overlapped, evict-on-full):
 
-  - swap-noprefetch is WORSE still (-17.8% at x5): the proactive swap-out is
-    the harmful part; prefetch is a small (5-6 fires) mitigation, not a
-    driver. The lulls between bursts are not long/empty enough for the 5s
-    prediction window to land useful prefetches.
-  - swap-wo-freq / swap-wo-swap are within 0.3% of swap-full: no single cost
-    term carries anything, because the whole timer approach is net-negative
-    in this regime.
-  - react-dep (phase 6's dependency-aware eviction, NO timer) is the actual
-    winner: +1% to +4% over react-lru, consistent across every config
-    (tight pool, long prefix, fast drift).
+    workload    react-lru  swap-full  swap vs react-lru   (aggressive / conservative)
+    STEADY       261 / 352   260 / 353    +0.4% / -0.4%
+    BURST x5     263 / 364   262 / 360    +0.4% / +1.2%
+    BURST x10    277 / 401   271 / 390    +2.0% / +2.9%
 
-  ROBUSTNESS: swap-full ranges from -16% (default sweep) to +0.6% (fast
-  drift, generous lulls) to -1% (tight pool, long prefix). Never a win in
-  any configuration tested.
+  THE SIGN FLIPS. swap-full is neutral-to-positive at ELORA's engine, and the
+  adapter-load churn is gone (swap-full 13-16 vs react-lru 19-24). So the
+  phase-7 negative result was a HARDWARE+MECHANISM-REGIME artifact, not a
+  policy defect.
 
-  RECONCILIATION with ELORA-WOS's 1.42x: same pattern as phases 4-6. ELORA-WOS
-  replaces the cost model with plain LRU BUT KEEPS proactive timer-driven
-  swapping and prefetch scaffolding; our react-lru has no timer at all.
-  ELORA's H800 has 128GB/s PCIe (8x ours) and 80GB HBM, so an aggressive
-  proactive swapper churns far more cheaply there; and their Azure-trace
-  bursts may have the long idle windows prefetch needs. On a single smaller
-  GPU with tight memory, reacting-on-demand beats a 100ms timer.
+  WHICH SWITCH CARRIES THE FLIP (--sweep, burst x10, one switch at a time from
+  the `ours` baseline):
+
+    switch      swap-full vs react-lru
+    none          -21.6%
+    pcie          -21.6%   (no-op: phase 7 has no PCIe KV path)
+    decode        -90.2%   (WORSE: a fixed proactive-eviction overhead is a
+                            bigger fraction of a smaller step)
+    swapmode      -2.6%    (async: big improvement, not quite over the line)
+    prefetch      -16.5%   (overlapped prefetch: small help)
+    swapout       +2.2%    <-- THE FLIP: "evict only when full"
+    all           +2.0%
+
+  NO SINGLE HARDWARE CONSTANT flips it: --sweep-const swap-cold (300 -> 10ms)
+  and --sweep-const decode (12 -> 2) both stay negative the whole way. The
+  cause is the PROACTIVE-EVICTION POLICY CHOICE. ELORA's "evict only when full"
+  is what avoids the churn; async swap compounds it.
+
+  - swap-noprefetch (-17.8% at x5, ours): confirms the proactive swap-out is
+    the harm, not prefetch.
+  - swap-wo-freq / swap-wo-swap within 0.5% of swap-full: no cost-model term
+    carries anything while the whole timer approach is net-negative.
+  - react-dep (phase 6 dependency-aware eviction, NO timer) is the consistent
+    winner at BOTH engines: +1% to +4% over react-lru.
+
+  RECONCILIATION with ELORA-WOS's 1.42x: ELORA-WOS keeps the proactive timer +
+  prefetch and only swaps the SCORING for LRU; our react-lru has no timer.
+  ELORA's engine (async streams, evict-on-full) is what makes a 100ms swapper
+  net-positive. Our earlier negative combined a synchronous, proactively-
+  evicting model with A10-class hardware -- three mismatches, each now measured.
 
 Run:  python phase7_cost_swapper.py
-      python phase7_cost_swapper.py --burst 1 5 10 --prefix-tokens 400
+      python phase7_cost_swapper.py --hw elora-aggressive --burst 1 5 10
+      python phase7_cost_swapper.py --sweep --hw-list ours --burst 10
+      python phase7_cost_swapper.py --sweep-const swap-cold --sweep-range 10 300 8 --burst 10
 """
 
 import argparse
 import math
 from collections import deque
 
+from dataclasses import replace as _replace
 from core import (MB_PER_TOKEN, PREFILL_MS_PER_TOKEN, DECODE_MS_PER_TOKEN,
-                  SWAP_COLD_MS, ADAPTER_MB, make_bursty_workload, percentile)
+                  SWAP_COLD_MS, ADAPTER_MB, HardwareProfile, OURS, get_profile,
+                  make_bursty_workload, percentile)
 
 STEP_TOKEN_BUDGET = 512
 FIXED_STEP_MS = 4.0
@@ -338,12 +383,26 @@ class SeqState:
 # ==========================================================================
 
 class Phase7Sim:
-    def __init__(self, requests, conversations, pool_mb, policy, max_loras):
+    def __init__(self, requests, conversations, pool_mb, policy, max_loras,
+                 hw=OURS):
+        hw = get_profile(hw)
+        self.hw = hw
+        self.adapter_mb = hw.adapter_mb
+        self.prefill_ms_per_token = hw.prefill_ms_per_token
+        self.decode_ms_per_token = hw.decode_ms_per_token
+        self.swap_cold_ms = hw.swap_cold_ms
+        self.swap_mode = hw.swap_mode              # "sync" | "async"
+        self.prefetch_cost = hw.prefetch_cost      # "charged" | "overlapped"
+        self.swap_out_when = hw.swap_out_when      # "highwater" | "full"
         self.pool_mb = pool_mb
         self.policy = policy
         self.max_loras = max_loras
         self.tree = RadixTree()
         self.adapters_mb = {}
+        # async swap: adapter id -> wall time its transfer completes
+        self._adapter_ready = {}
+        # sync prefetch: cost accrued this tick, folded into the next step
+        self._pending_prefetch_ms = 0.0
         self.incoming = deque(sorted(requests, key=lambda r: r.arrival_time))
         self.convos = {c.conversation_id: c for c in conversations}
 
@@ -431,8 +490,10 @@ class Phase7Sim:
             return
         self.last_swapper_run = self.now
 
-        # 1. proactive swap-OUT if above high-water
-        if self.fill() > HIGH_WATER:
+        # 1. proactive swap-OUT if above high-water.  ELORA (VI-C) evicts only
+        #    "when full" -- --swap-out-when full skips this, leaving make_room()
+        #    to evict reactively on demand.
+        if self.swap_out_when == "highwater" and self.fill() > HIGH_WATER:
             target_free = self.pool_mb * (1.0 - LOW_WATER)
             self._evict_to(target_free, self.pinned_nodes(),
                            self.pinned_adapters())
@@ -447,21 +508,36 @@ class Phase7Sim:
                     continue
                 if a in self.adapters_mb:
                     continue
-                if self.free_mb() >= ADAPTER_MB:
-                    self.adapters_mb[a] = ADAPTER_MB
+                if self.free_mb() >= self.adapter_mb:
+                    self.adapters_mb[a] = self.adapter_mb
                     self.prefetch_loads += 1
+                    if self.prefetch_cost == "charged":
+                        # sync HW: the copy costs wall time, folded into the
+                        # next step (honest -- makes 'ours' slightly worse).
+                        self._pending_prefetch_ms += self.swap_cold_ms
+                    else:
+                        # overlapped: runs on a CUDA stream during the lull;
+                        # ready before the burst, no wall-clock charge, but the
+                        # adapter is not USABLE until the transfer finishes.
+                        self._adapter_ready[a] = self.now + self.swap_cold_ms
                     break
 
     # ---------- ensure resident ----------
     def ensure_adapter(self, a):
         if a in self.adapters_mb:
             return 0.0
-        self.make_room(ADAPTER_MB)
-        if self.free_mb() < ADAPTER_MB - 1e-9:
+        self.make_room(self.adapter_mb)
+        if self.free_mb() < self.adapter_mb - 1e-9:
             return 0.0
-        self.adapters_mb[a] = ADAPTER_MB
+        self.adapters_mb[a] = self.adapter_mb
         self.adapter_loads += 1
-        return SWAP_COLD_MS
+        if self.swap_mode == "async":
+            # transfer overlaps inference (ELORA's Torch-stream model): no
+            # wall-clock charge to this step; the request that needs `a` is
+            # deferred in schedule() until _adapter_ready[a].
+            self._adapter_ready[a] = self.now + self.swap_cold_ms
+            return 0.0
+        return self.swap_cold_ms
 
     # ---------- scheduling ----------
     def schedule(self):
@@ -489,6 +565,12 @@ class Phase7Sim:
             self.waiting.popleft()
             swap_ms += self.ensure_adapter(a)
             if a not in self.adapters_mb:
+                deferred.append(r)
+                continue
+            # async swap: adapter memory is reserved but the transfer is still
+            # in flight -- the request cannot run until it lands. Other adapters
+            # in the batch proceed unaffected (that is the "overlap").
+            if self.now < self._adapter_ready.get(a, 0.0):
                 deferred.append(r)
                 continue
 
@@ -528,7 +610,7 @@ class Phase7Sim:
             if self.waiting:
                 # pool cannot fit the oldest waiter: force it, advance a step
                 r = self.waiting[0]
-                self.now += FIXED_STEP_MS + DECODE_MS_PER_TOKEN
+                self.now += FIXED_STEP_MS + self.decode_ms_per_token
                 self.batch and None
                 self.waiting.popleft()
                 r.finish(self.now - r.arrival_time)
@@ -548,9 +630,11 @@ class Phase7Sim:
                     s.phase = "decode"
 
         step_ms = (FIXED_STEP_MS + PER_SEQ_STEP_MS * len(self.batch)
-                   + DECODE_MS_PER_TOKEN
-                   + prefill_this * PREFILL_MS_PER_TOKEN
-                   + swap_ms)
+                   + self.decode_ms_per_token
+                   + prefill_this * self.prefill_ms_per_token
+                   + swap_ms
+                   + self._pending_prefetch_ms)     # sync prefetch cost, if any
+        self._pending_prefetch_ms = 0.0
         self.now += step_ms
         self.steps += 1
 
@@ -601,14 +685,15 @@ SEEDS = 5
 
 
 def trial(burst_factor, policy_name, seed, pool_mb, prefix_tokens=400,
-          max_loras=5, drift_period=60000.0):
+          max_loras=5, drift_period=60000.0, hw="ours"):
     convos, reqs = make_bursty_workload(
         n_conversations=60, n_adapters=12, turns_per_convo=5, mean_tokens=40,
         base_rate=0.0006, turn_gap=6000, shared_prefix_tokens=prefix_tokens,
         shared_prefix_groups=3, burst_factor=burst_factor,
         burst_period=40000.0, burst_duty=0.25,
         popularity_drift_period=drift_period, seed=seed)
-    sim = Phase7Sim(reqs, convos, pool_mb, POLICIES[policy_name](), max_loras)
+    sim = Phase7Sim(reqs, convos, pool_mb, POLICIES[policy_name](), max_loras,
+                    hw=hw)
     sim.run()
     lats = [r.latency() for r in sim.finished]
     ttfts = list(sim.ttft.values())
@@ -632,6 +717,140 @@ def avg(**kw):
     return {k: sum(r[k] for r in rows) / SEEDS for k in rows[0]}
 
 
+# --- hardware-profile helpers (shared by main + sweep modes) --------------
+
+_SWITCH_FIELDS = {
+    "pcie": ["pcie_ms_per_mb"],        # phase 7 has no PCIe KV path -> no-op here, kept for parity
+    "decode": ["decode_ms_per_token", "prefill_ms_per_token"],
+    "swapmode": ["swap_mode"],
+    "prefetch": ["prefetch_cost"],
+    "swapout": ["swap_out_when"],
+}
+
+
+def _apply_switch(base, switch, elora):
+    """Return `base` with the field(s) named by `switch` set to their `elora`
+    profile values -- for one-at-a-time attribution."""
+    if switch == "none":
+        return base
+    if switch == "all":
+        fields = [f for fs in _SWITCH_FIELDS.values() for f in fs]
+    else:
+        fields = _SWITCH_FIELDS[switch]
+    return _replace(base, **{f: getattr(elora, f) for f in fields})
+
+
+def _build_hw(name, overrides):
+    hw = get_profile(name)
+    if overrides:
+        hw = _replace(hw, **overrides)
+    return hw
+
+
+def _cli_overrides(args):
+    ov = {}
+    if getattr(args, "pcie_ms_per_mb", None) is not None:
+        ov["pcie_ms_per_mb"] = args.pcie_ms_per_mb
+    if getattr(args, "decode_ms_per_token", None) is not None:
+        ov["decode_ms_per_token"] = args.decode_ms_per_token
+    if getattr(args, "prefill_ms_per_token", None) is not None:
+        ov["prefill_ms_per_token"] = args.prefill_ms_per_token
+    if getattr(args, "swap_cold_ms", None) is not None:
+        ov["swap_cold_ms"] = args.swap_cold_ms
+    if getattr(args, "swap_mode", None):
+        ov["swap_mode"] = args.swap_mode
+    if getattr(args, "swap_out_when", None):
+        ov["swap_out_when"] = args.swap_out_when
+    if getattr(args, "prefetch_cost", None):
+        ov["prefetch_cost"] = args.prefetch_cost
+    return ov
+
+
+def _delta(base_p50, p50):
+    return 100.0 * (base_p50 - p50) / base_p50 if base_p50 else float("nan")
+
+
+# --- sweep modes ---------------------------------------------------------------
+
+def run_sweep(args):
+    """{--hw-list} x {--burst} x {--switch-list} -> the swapper's sign per cell."""
+    from core import ELORA_AGGRESSIVE
+    print(f"SWEEP  pool {args.pool_mb:.0f}MB | prefix {args.prefix_tokens} tok | "
+          f"max_loras {args.max_loras} | mean of {SEEDS} seeds")
+    print(f"{'hw':>18} {'burst':>6} {'switch':>10} {'swap-full':>10} "
+          f"{'react-lru':>10} {'delta%':>9} {'sign':>5}")
+    print("-" * 74)
+    for hwname in args.hw_list:
+        base_hw = get_profile(hwname)
+        for bf in args.burst:
+            for sw in args.switch_list:
+                hw = _apply_switch(base_hw, sw, ELORA_AGGRESSIVE)
+                sf = avg(burst_factor=bf, policy_name="swap-full",
+                         pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                         max_loras=args.max_loras, drift_period=args.drift_period,
+                         hw=hw)
+                rl = avg(burst_factor=bf, policy_name="react-lru",
+                         pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                         max_loras=args.max_loras, drift_period=args.drift_period,
+                         hw=hw)
+                d = _delta(rl["p50"], sf["p50"])
+                print(f"{hwname:>18} {bf:>6.0f} {sw:>10} {sf['p50']:>10.0f} "
+                      f"{rl['p50']:>10.0f} {d:>+8.1f}% {'+' if d >= 0 else '-':>5}")
+        print()
+    print("First '+' row = the swapper stops being net-negative. Compare rows to")
+    print("see which single switch (pcie / decode / swapmode / prefetch / swapout)")
+    print("carries the flip.")
+
+
+_CONST_FIELD = {
+    "pcie": "pcie_ms_per_mb", "decode": "decode_ms_per_token",
+    "swap-cold": "swap_cold_ms", "prefill": "prefill_ms_per_token",
+}
+
+
+def run_sweep_const(args):
+    """Vary ONE hardware constant across a geometric range; find the sign flip."""
+    field = _CONST_FIELD[args.sweep_const]
+    lo, hi, n = args.sweep_range
+    n = int(n)
+    ratio = (hi / lo) ** (1.0 / (n - 1)) if n > 1 else 1.0
+    vals = [lo * ratio ** i for i in range(n)]
+    base_hw = _build_hw(args.hw, _cli_overrides(args))
+    print(f"SWEEP-CONST {field}  from {lo:g} to {hi:g} ({n} pts, geometric)")
+    print(f"start hw={base_hw.name} | burst {args.burst[0]:.0f} | pool "
+          f"{args.pool_mb:.0f}MB | prefix {args.prefix_tokens} tok | "
+          f"{args.sweep_policy} vs {args.sweep_baseline} | mean of {SEEDS} seeds\n")
+    print(f"{field:>18} {args.sweep_policy:>12} {args.sweep_baseline:>12} "
+          f"{'delta%':>9} {'sign':>5}")
+    print("-" * 62)
+    bf = args.burst[0]
+    prev = None
+    crossover = None
+    for v in vals:
+        hw = _replace(base_hw, **{field: v})
+        pol = avg(burst_factor=bf, policy_name=args.sweep_policy,
+                  pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                  max_loras=args.max_loras, drift_period=args.drift_period, hw=hw)
+        bas = avg(burst_factor=bf, policy_name=args.sweep_baseline,
+                  pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                  max_loras=args.max_loras, drift_period=args.drift_period, hw=hw)
+        d = _delta(bas["p50"], pol["p50"])
+        print(f"{v:>18.4f} {pol['p50']:>12.0f} {bas['p50']:>12.0f} "
+              f"{d:>+8.1f}% {'+' if d >= 0 else '-':>5}")
+        if prev is not None and (prev[1] < 0) != (d < 0):
+            # linear-interp the crossover in the swept field
+            (v0, d0), (v1, d1) = prev, (v, d)
+            crossover = v0 + (v1 - v0) * (0 - d0) / (d1 - d0)
+        prev = (v, d)
+    print()
+    if crossover is not None:
+        print(f"VERDICT: {args.sweep_policy} crosses zero at {field} ~= "
+              f"{crossover:.4f} (interp, burst x{bf:.0f}).")
+    else:
+        print(f"VERDICT: no sign flip across the range -- "
+              f"{args.sweep_policy} stays {'positive' if prev[1] >= 0 else 'negative'}.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -643,12 +862,46 @@ def main():
     ap.add_argument("--policies", nargs="+",
                     default=["react-lru", "react-dep", "swap-full",
                              "swap-noprefetch", "swap-wo-freq", "swap-wo-swap"])
+    # hardware profile + per-constant / per-switch overrides
+    ap.add_argument("--hw", default="ours",
+                    choices=["ours", "elora", "elora-aggressive", "elora-conservative"])
+    ap.add_argument("--pcie-ms-per-mb", type=float, default=None)
+    ap.add_argument("--decode-ms-per-token", type=float, default=None)
+    ap.add_argument("--prefill-ms-per-token", type=float, default=None)
+    ap.add_argument("--swap-cold-ms", type=float, default=None)
+    ap.add_argument("--swap-mode", choices=["sync", "async"], default=None)
+    ap.add_argument("--swap-out-when", choices=["full", "highwater"], default=None)
+    ap.add_argument("--prefetch-cost", choices=["charged", "overlapped"], default=None)
+    # sweep modes
+    ap.add_argument("--sweep", action="store_true",
+                    help="grid over --hw-list x --burst x --switch-list")
+    ap.add_argument("--hw-list", nargs="+", default=["ours", "elora-aggressive"])
+    ap.add_argument("--switch-list", nargs="+",
+                    default=["none", "pcie", "decode", "swapmode", "prefetch",
+                             "swapout", "all"])
+    ap.add_argument("--sweep-const", choices=list(_CONST_FIELD),
+                    help="vary ONE constant across --sweep-range; find the crossover")
+    ap.add_argument("--sweep-range", type=float, nargs=3, default=[0.008, 0.105, 9],
+                    metavar=("LO", "HI", "N"))
+    ap.add_argument("--sweep-policy", default="swap-full")
+    ap.add_argument("--sweep-baseline", default="react-lru")
     args = ap.parse_args()
+
+    if args.sweep:
+        run_sweep(args)
+        return
+    if args.sweep_const:
+        run_sweep_const(args)
+        return
+
+    hw = _build_hw(args.hw, _cli_overrides(args))
 
     print(__doc__)
     print(f"pool {args.pool_mb:.0f}MB | max_loras {args.max_loras} | prefix "
           f"{args.prefix_tokens} tok | drift {args.drift_period/1000:.0f}s | "
-          f"adapter {ADAPTER_MB}MB | mean of {SEEDS} seeds\n")
+          f"hw={hw.name} (pcie={hw.pcie_ms_per_mb:.4f} decode={hw.decode_ms_per_token:.2f} "
+          f"mode={hw.swap_mode} pf={hw.prefetch_cost} out={hw.swap_out_when}) | "
+          f"adapter {hw.adapter_mb:.0f}MB | mean of {SEEDS} seeds\n")
 
     for bf in args.burst:
         tag = "STEADY" if bf <= 1.0 else f"BURST x{bf:.0f}"
@@ -660,7 +913,7 @@ def main():
         for pol in args.policies:
             m = avg(burst_factor=bf, policy_name=pol, pool_mb=args.pool_mb,
                     prefix_tokens=args.prefix_tokens, max_loras=args.max_loras,
-                    drift_period=args.drift_period)
+                    drift_period=args.drift_period, hw=hw)
             if pol == "react-lru":
                 base = m["p50"]
             delta = f"{100*(base-m['p50'])/base:+.1f}%" if base else ""
@@ -671,7 +924,8 @@ def main():
 
     print("Question: does the 100ms timer + cost model + prefetch beat")
     print("react-on-full, and does the gap only open once traffic is bursty?")
-    print("ELORA claims replacing it with LRU costs 1.42x TTFT.")
+    print("ELORA claims replacing it with LRU costs 1.42x TTFT. Run --hw elora")
+    print("and --sweep-const pcie to test that apples-to-apples.")
 
 
 if __name__ == "__main__":

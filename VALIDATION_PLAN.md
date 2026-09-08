@@ -100,3 +100,24 @@ and workload parameters. A validation nobody can reproduce is worth little.
 If the numbers diverge, the honest move is to report the divergence and explain
 which simplification caused it — the reclaim pool and prefix caching are the two
 most likely culprits, and both are already named in the README's limitations.
+
+## 10. Hardware-profile checkpoint (done in-sim, pre-GPU)
+
+Phases 5–7 take `--hw {ours,elora-aggressive,elora-conservative}` so the ELORA
+comparison is apples-to-apples on the constants, not just the policy. Recorded
+findings:
+
+- **Phase 5**: the stale-KV pathology is hardware-robust — identical *shape*
+  at `--hw ours` and `--hw elora` (fit-ratio effect, not bandwidth).
+- **Phase 6**: dependency-scoring's benefit *shrinks* as HW gets faster
+  (+6.7% → +2.2% at 800 shared tokens).
+- **Phase 7**: the 100 ms swapper is net-negative at our engine model
+  (−5% to −22%), **net-positive at ELORA's** (+0.4% to +2.9%).
+  `phase7 --sweep` isolates `--swap-out-when full` (a policy choice) as the
+  single change that flips the sign; `--sweep-const` shows no hardware
+  constant alone does. This reproduces the *direction* of ELORA-WOS's 1.42×
+  at a plausible H800 constant band — not a reproduction of the magnitude.
+
+When the GPU run happens, the swapper comparison should be checked against
+`--hw` matched to the actual rented card (A10 → `ours`; A100/H100 → an
+`elora`-like profile), not the default.

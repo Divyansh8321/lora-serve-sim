@@ -17,10 +17,13 @@ But decomposing their fix into levers their own ablations don't separate:
   "biggest-KV-first, adapters-last" rule already avoids that.
 - **The elaborate dependency *scoring* ELORA centres its design on is a real
   but ~2–7% refinement** in these workloads — not the 51% its whole-vs-nothing
-  ablation implies.
-- **ELORA's 100 ms timer-driven cost-model swapper is net-negative here**
-  (−4% to −16% p50, worse under bursts) — on a single smaller GPU, reacting on
-  demand beats a proactive timer.
+  ablation implies. And its value *shrinks* as the hardware gets faster.
+- **ELORA's 100 ms timer-driven cost-model swapper is net-negative at our
+  engine model** (−5% to −22% p50, worse under bursts) **but flips to
+  net-positive (+0.4% to +2.9%) at ELORA's engine** (async CUDA-stream swaps +
+  "evict only when full"). The `--sweep` attribution isolates the single
+  responsible change: **`--swap-out-when full`** — a *policy* choice, not a
+  hardware constant. No hardware constant alone flips it.
 
 **What ELORA actually claims** (paper, HPCA 2026 — not paraphrased from memory):
 a *unified caching pool* + a *dependency-aware cache manager* (a RadixAttention
@@ -44,6 +47,13 @@ python phase7_cost_swapper.py        # + ELORA's 100ms cost-model swapper, burst
 ```
 Pure standard library. No GPU, no model, no network.
 
+**Hardware profiles.** Phases 5–7 take `--hw {ours,elora,elora-aggressive,
+elora-conservative}` — `ours` is a single ~A10 (PCIe 40 GB/s); `elora` is the
+H800 regime (PCIe 128 GB/s, ~3.35 TB/s HBM, async overlapped swaps, evict-on-
+full). This makes the ELORA comparison apples-to-apples. `phase7` also has
+`--sweep` (which engine switch flips the swapper's sign) and `--sweep-const`
+(does any hardware constant alone), plus `sweeps/*.py` as standalone artifacts.
+
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
 `validation/README.md`. **All 7 phases are built** — phases 5–7 progressively
@@ -59,7 +69,7 @@ match ELORA's real execution model so the comparison is like-for-like.
 | 4 | + **unified** pool | at the packed point **−7% p50**, stale KV **22% → 0%**; ordering-only ≈ dependency-aware |
 | 5 | + **continuous batching** | pathology reproduces (50% stale KV) but is now **timing-driven** — a sharp TTFT knee from *admission stall*; new **TPOT channel** (17→27) from recompute-prefill; unified stays flat |
 | 6 | + **RadixAttention prefix tree** + prefix sharing | blind LRU-of-leaves **collapses** (p50 ×40) under sharing; prefix-aware **ordering** avoids it; ELORA-style **dependency scoring** adds a further **2–7%** on top — real, but far short of ELORA's claimed 1.51× |
-| 7 | + **ELORA's 100 ms cost-model swapper** + bursty/drifting traffic | the timer-driven swapper is **net-negative** here (−4% to −16% p50, worse as bursts intensify) — proactive swap-out churns; **react-on-demand wins**. Opposite of ELORA's "−1.42× without it" |
+| 7 | + **ELORA's 100 ms cost-model swapper** + bursty/drifting traffic | net-negative at our engine (−5% to −22% p50); **flips to +0.4–2.9% at ELORA's engine**. `--sweep` names the cause: **`--swap-out-when full`** (a policy choice), not a hardware constant |
 
 ### Phase 2 — the pathology is architectural, not incidental
 
@@ -221,35 +231,51 @@ during idle windows. ELORA's ablation: replace it with plain LRU and TTFT gets
 
 This needs bursty traffic to matter, so phase 7 adds `make_bursty_workload`:
 inhomogeneous Poisson arrivals (5–10× rate spikes) and a Zipf popularity
-ranking that re-shuffles every 60 s. On a 2400 MB pool, 400-token shared
-prefix:
+ranking that re-shuffles every 60 s. On a 2400 MB pool, 400-token shared prefix,
+run at **both** engine models via `--hw`:
 
-| workload | `react-lru` p50 | `react-dep` p50 | `swap-full` p50 | swapper vs react-lru |
-|---|---|---|---|---|
-| steady | 753 | 745 | 781 | **−3.7%** |
-| burst ×5 | 877 | 845 | 981 | **−11.8%** |
-| burst ×10 | 1497 | 1460 | 1731 | **−15.6%** |
+| workload | `--hw ours` swap-full vs react-lru | `--hw elora-aggressive` | `--hw elora-conservative` |
+|---|---|---|---|
+| steady | **−4.7%** | +0.4% | −0.4% |
+| burst ×5 | **−17.4%** | +0.4% | +1.2% |
+| burst ×10 | **−21.6%** | **+2.0%** | **+2.9%** |
 
-**The timer-driven swapper is net-negative here — and worse as bursts
-intensify. The opposite of ELORA's claim.** The proactive swap-out is churn:
-it evicts entries at 92% fill that are needed again seconds later, so adapter
-loads climb (14 → 34 vs 14 → 23 for `react-lru`). `swap-noprefetch` is worse
-still (−17.8% at ×5), confirming the proactive *swap-out* is the harmful part;
-prefetch fires only 5–6 times and doesn't offset it. Term ablations
-(`swap-wo-freq`, `swap-wo-swap`) move <0.3% — no single term carries anything
-because the whole approach is net-negative in this regime.
+**At our engine the swapper is net-negative and worse under bursts. At ELORA's
+engine it flips to net-positive.** `--hw ours` = synchronous swap, prefetch
+costs wall time, proactive swap-out at 92% fill. `--hw elora` = async
+CUDA-stream swap (transfer overlaps inference), overlapped prefetch, **evict
+only when full**. (The `ours` numbers are more negative than earlier drafts
+because prefetch used to be modelled as free — `--prefetch-cost charged` now
+charges it, which is honest for synchronous hardware.)
+
+**Which change flips it** (`phase7 --sweep`, one switch at a time from `ours`,
+burst ×10):
+
+| switch flipped to ELORA value | swap-full vs react-lru |
+|---|---|
+| none (baseline) | −21.6% |
+| `pcie` (128 GB/s) | −21.6% — no-op, phase 7 has no PCIe KV path |
+| `decode` (×0.18 HBM) | **−90.2%** — *worse*: a fixed proactive-eviction overhead is a bigger fraction of a smaller step |
+| `swapmode` (async) | −2.6% — large improvement, not quite over the line |
+| `prefetch` (overlapped) | −16.5% — small help |
+| **`swapout` (evict only when full)** | **+2.2%** — **the flip** |
+| all together | +2.0% |
+
+**No hardware constant alone flips the sign** — `--sweep-const swap-cold`
+(300 → 10 ms) and `--sweep-const decode` (12 → 2) both stay negative across the
+whole range. The cause is the **proactive-eviction *policy* choice**. ELORA's
+"evict only when full" is what avoids the churn; async swap compounds it.
 
 **`react-dep`** — phase 6's dependency-aware eviction with *no timer* — is the
-consistent winner (+1% to +4% over `react-lru` across every config: tight pool,
-long prefix, fast drift).
+consistent winner at *both* engines (+1% to +4% over `react-lru`).
 
-**Reconciliation with ELORA-WOS's 1.42×:** same pattern as every other phase.
-ELORA-WOS keeps the proactive timer + prefetch scaffolding and only swaps the
-*scoring* for LRU; our `react-lru` has no timer at all. ELORA's H800 has 8×
-our PCIe bandwidth and 80 GB HBM, so aggressive proactive swapping churns far
-more cheaply there, and their Azure-trace bursts may have the long idle windows
-prefetch needs. **On a single smaller GPU with tight memory, reacting on demand
-beats a 100 ms timer.**
+**Reconciliation with ELORA-WOS's 1.42×:** ELORA-WOS keeps the proactive timer
++ prefetch and only swaps the *scoring* for LRU; our `react-lru` has no timer.
+ELORA's engine — async streams + evict-on-full — is what makes a 100 ms swapper
+net-positive. Our earlier phase-7 negative combined a synchronous,
+proactively-evicting model with A10-class hardware: three separate mismatches,
+each now measured. On that engine, react-on-demand wins; on ELORA's, the
+swapper is a small net gain and the scoring is a further refinement on top.
 
 ## Calibration
 
@@ -266,10 +292,23 @@ The PCIe figure matters: at vLLM's 128KB swap granularity, per-call dispatch
 overhead *dominates* bandwidth. Using the spec-sheet 40GB/s number alone
 (0.025 ms/MB) underestimates transfer cost 4.2×.
 
-**Hardware mismatch to keep in mind:** ELORA runs on H800 (= A100/H100 class,
-80GB) over PCIe 5.0 at 128GB/s. Our constants target a smaller box (A10-ish,
-40GB/s). Absolute latencies are not directly comparable to ELORA's; the *shape*
-of the degradation curve is what the comparison rests on.
+**Hardware profiles (`core.py`, used by phases 5–7 via `--hw`).** The
+calibration table above is the `OURS` profile. `ELORA_AGGRESSIVE` /
+`ELORA_CONSERVATIVE` model ELORA's H800:
+
+| field | `OURS` | `ELORA_*` | source |
+|---|---|---|---|
+| PCIe transfer | 0.105 ms/MB | 0.008 ms/MB | PCIe 5.0 @ 128 GB/s (ELORA Table II) vs our ~40 GB/s |
+| decode / token | 12 ms | ×0.18 (agg) / ×0.35 (cons) | H800 HBM ~3.35 TB/s vs our implied ~600 GB/s; **swept as a band** since it's the biggest lever |
+| prefill / token | 0.15 ms | ×0.13 / ×0.30 | same, FLOPs-scaled |
+| adapter cold load | 300 ms | 300 ms | disk/S3 latency — not a GPU property, held constant |
+| adapter warm load | 30 ms | 2.3 ms | PCIe-bound, scales with bandwidth |
+| swap engine | sync, charged prefetch, evict-at-92% | async overlapped, evict-on-full | ELORA §VI-C, §VII ("no extra swapping overhead") |
+
+`mb_per_token` and `adapter_mb` are model architecture — **identical in every
+profile**. Absolute latencies at `--hw ours` are not directly comparable to
+ELORA's; the *shape* of each curve, and *whether a policy's sign flips between
+profiles*, is what the comparison rests on.
 
 **Adapter size: corrected from 20 MB to 180 MB.** Earlier drafts used 20 MB
 (≈ rank-8, q/v-only — a narrow-adapter regime). First-principles for the
@@ -301,11 +340,11 @@ is exactly `0.025` (40 GB/s) + `0.080` (10 µs dispatch per 128 KB).
 Things this project has *not* earned the right to claim yet, stated plainly so a
 reader can calibrate:
 
-1. **One workload family.** Every number is one shape: 40 conversations, 12
-   adapters, Zipf skew 1.0, 5 turns, 6 s gaps. Phase 6 adds a shared-prefix
-   variant but the arrival/adapter structure is unchanged. No Azure-trace
-   burstiness, no drifting adapter popularity (both in ELORA's eval).
-2. **Batch-at-a-time in phases 1–4.** Phases 5–6 add continuous batching.
+1. **One workload family.** Phases 2–6: 40 conversations, 12 adapters, Zipf
+   skew 1.0, 5 turns, 6 s gaps, Poisson arrivals. Phase 6 adds shared prefixes;
+   phase 7 adds bursts + drifting popularity (`make_bursty_workload`) — a
+   synthetic stand-in for the Azure Function trace, not the trace itself.
+2. **Batch-at-a-time in phases 1–4.** Phases 5–7 add continuous batching.
    Phases 1–4 keep the simpler model on purpose — each isolates one variable.
 3. **The 60% rescue figure is an estimate.** Not measured in-sim.
 4. **Validation is a plan, not a result** until `validation/run_sweep.sh` has
@@ -317,6 +356,13 @@ reader can calibrate:
 6. **Adapter size is 180 MB** (rank-32, ELORA's rank) — corrected from an
    earlier 20 MB. All phases re-run; separate-pool results are scale-invariant,
    unified-pool results got stronger (see Calibration).
+7. **The `ELORA_*` hardware profiles are estimates.** PCIe is a solid figure
+   (128 GB/s, from the paper); the decode/prefill scaling is a swept
+   *aggressive/conservative band*, not a measured value. And even the H800
+   profile keeps our batch-at-a-time step model and synthetic bursts — so
+   phase 7's "swapper flips positive at ELORA's engine" is the *direction*
+   ELORA reports, at a plausible constant band, not a reproduction of their
+   1.42×.
 
 ## Limitations
 
@@ -330,6 +376,7 @@ reader can calibrate:
 | remote KV tiers | LMCache backends: Redis/Valkey, Mooncake, NVMe, S3 | — |
 | multi-node routing | biggest real-world lever; invisible to a single-node model | — |
 | KV compression | MLA (~90% reduction), FP8 KV (~50%) | — |
+| hardware regime | ELORA is on H800 (128 GB/s PCIe, 80 GB HBM); we're A10-class | ✅ **phases 5–7** `--hw` |
 
 ## Roadmap
 
@@ -341,7 +388,7 @@ their real one". Full detail in `ROADMAP.md`.
 |---|---|---|---|
 | **5** | continuous batching (step clock, in-flight sequences, mid-stream admission, adapter pinning) | ELORA runs entirely under continuous batching; without it our staleness mechanism is structurally different from theirs | ✅ done — `phase5_continuous_batching.py` |
 | **6** | RadixAttention prefix tree (shared system prompts, LoRA-rooted subtrees, prefix-aware eviction) | ELORA's dependency manager *is* a prefix tree | ✅ done — `phase6_radix_prefix.py`. Result: blind LRU-of-leaves collapses; prefix-aware *ordering* fixes it; dependency *scoring* adds ~2–7% on top |
-| **7** | ELORA-style 100 ms cost-model swapper + idle prefetch, bursty/drifting workload | reproduces ELORA-WOS ablation | ✅ done — `phase7_cost_swapper.py`. Result: the timer-driven swapper is net-negative here (−4% to −16%); react-on-demand wins; `react-dep` (phase 6, no timer) is best |
+| **7** | ELORA-style 100 ms cost-model swapper + idle prefetch, bursty/drifting workload, **`--hw` profiles** | reproduces ELORA-WOS ablation | ✅ done — `phase7_cost_swapper.py`. Result: net-negative at our engine (−5% to −22%), **flips to +0.4–2.9% at ELORA's engine**; `--sweep` names `--swap-out-when full` as the cause (a policy choice, not hardware). `react-dep` (no timer) wins at both engines |
 
 ## References
 

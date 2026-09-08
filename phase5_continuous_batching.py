@@ -90,17 +90,28 @@ all-linear, ELORA's rank; separate KV pool 4000MB):
   2-4, caused by the execution model, not a bug. It would reappear with
   longer conversations / tighter KV pools.
 
+HARDWARE PROFILE (--hw {ours,elora,elora-aggressive,elora-conservative}):
+  swaps the time constants for ELORA's H800 regime (PCIe 128GB/s -> pcie_ms
+  0.008; HBM ~3.35TB/s -> decode x0.18..0.35). The pathology is HW-ROBUST:
+  at --hw elora-aggressive the separate pool still degrades 265 -> 578 with
+  50% stale KV at max_loras=3, and the unified pool still stays flat
+  (265 -> 265). Absolute latencies drop ~3x; the shape does not move. This
+  is expected -- the pathology is a fit-RATIO effect (adapters that fit /
+  adapters in use), not a bandwidth effect.
+
 Run:  python phase5_continuous_batching.py
+      python phase5_continuous_batching.py --hw elora-aggressive
       python phase5_continuous_batching.py --pool unified --unified-cap 1800
-      python phase5_continuous_batching.py --pool separate --kv-gpu 500
 """
 
 import argparse
 import math
 from collections import deque, OrderedDict
+from dataclasses import replace as _replace
 
 from core import (MB_PER_TOKEN, PREFILL_MS_PER_TOKEN, DECODE_MS_PER_TOKEN,
                   SWAP_COLD_MS, SWAP_WARM_MS, PCIE_MS_PER_MB, ADAPTER_MB,
+                  HardwareProfile, OURS, get_profile,
                   make_multi_turn_workload, percentile)
 
 # --- step-loop constants ---
@@ -388,7 +399,15 @@ POLICIES = {p.name: p for p in [BlindLRU, SignalLRU, CostAware, KVFirst]}
 
 class ContinuousBatchSim:
     def __init__(self, requests, conversations, cache, policy, max_loras,
-                 preempt="recompute"):
+                 preempt="recompute", hw=OURS):
+        hw = get_profile(hw)
+        self.hw = hw
+        self.mb_per_token = hw.mb_per_token
+        self.prefill_ms_per_token = hw.prefill_ms_per_token
+        self.decode_ms_per_token = hw.decode_ms_per_token
+        self.swap_cold_ms = hw.swap_cold_ms
+        self.swap_warm_ms = hw.swap_warm_ms
+        self.pcie_ms_per_mb = hw.pcie_ms_per_mb
         self.cache = cache
         self.policy = policy
         self.max_loras = max_loras
@@ -569,12 +588,12 @@ class ContinuousBatchSim:
         self.cache.place_adapter(a, "gpu")
         if where == "cpu":
             self.adapter_from_cpu += 1
-            return SWAP_WARM_MS
+            return self.swap_warm_ms
         self.adapter_from_disk += 1
-        return SWAP_COLD_MS
+        return self.swap_cold_ms
 
     def prompt_mb(self, cid):
-        return self.convos[cid].kv_cache_size * MB_PER_TOKEN
+        return self.convos[cid].kv_cache_size * self.mb_per_token
 
     def ensure_kv_resident(self, cid, adapter_id):
         """Bring a conversation's existing KV back to GPU. Returns (ms, recompute_tokens).
@@ -586,7 +605,7 @@ class ContinuousBatchSim:
         where = self.cache.kv_where(cid)
         if where == "gpu":
             return 0.0, 0
-        need = convo.kv_cache_size * MB_PER_TOKEN
+        need = convo.kv_cache_size * self.mb_per_token
         self.make_room_for_kv(need, protect_cid=cid)
         if not self.cache.kv_fits_gpu(need):
             # cannot hold history at all -> recompute and keep going without it cached
@@ -596,7 +615,7 @@ class ContinuousBatchSim:
         if where == "cpu":
             self.cache.set_kv_tier(cid, "gpu")
             self.kv_from_cpu += 1
-            return need * PCIE_MS_PER_MB, 0
+            return need * self.pcie_ms_per_mb, 0
         # not resident anywhere -> recompute, then cache the rebuilt result
         self.cache.place_kv(cid, need, adapter_id, "gpu")
         self.kv_recomputes += 1
@@ -654,9 +673,9 @@ class ContinuousBatchSim:
             self.policy.touch_kv(r.conversation_id, self.now)
 
             if not self.cache.kv_on_gpu(r.conversation_id) and self.cache.kv_fits_gpu(
-                    max(prompt_tokens, 1) * MB_PER_TOKEN):
+                    max(prompt_tokens, 1) * self.mb_per_token):
                 self.cache.place_kv(r.conversation_id,
-                                    max(prompt_tokens, 0) * MB_PER_TOKEN, a, "gpu")
+                                    max(prompt_tokens, 0) * self.mb_per_token, a, "gpu")
 
         self.waiting.extendleft(reversed(deferred))
         return swap_ms_this_step
@@ -686,8 +705,8 @@ class ContinuousBatchSim:
         # step duration: one shared decode pass + the prefill chunk riding along
         step_ms = (FIXED_STEP_MS
                    + PER_SEQ_STEP_MS * len(self.batch)
-                   + DECODE_MS_PER_TOKEN                     # the one weight-read pass
-                   + prefill_this_step * PREFILL_MS_PER_TOKEN
+                   + self.decode_ms_per_token                # the one weight-read pass
+                   + prefill_this_step * self.prefill_ms_per_token
                    + swap_ms)
         self.now += step_ms
         self.steps += 1
@@ -707,7 +726,7 @@ class ContinuousBatchSim:
                 convo = self.convos[s.cid]
                 convo.grow_cache(1)
                 if self.cache.kv_on_gpu(s.cid):
-                    self.cache.set_kv_size(s.cid, convo.kv_cache_size * MB_PER_TOKEN)
+                    self.cache.set_kv_size(s.cid, convo.kv_cache_size * self.mb_per_token)
             if s.done():
                 s.req.finish(self.now - s.req.arrival_time)
                 self.finished.append(s.req)
@@ -752,13 +771,14 @@ def build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu, cap, cpu,
 
 
 def trial(pool, max_loras, policy_name, seed, adapter_size,
-          kv_gpu_mb=4000, adapter_cpu=0, kv_cpu=0, unified_cap=4000, unified_cpu=0):
+          kv_gpu_mb=4000, adapter_cpu=0, kv_cpu=0, unified_cap=4000, unified_cpu=0,
+          hw="ours"):
     convos, reqs = workload(seed)
     adapter_mb = max_loras * adapter_size
     cache = build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu,
                         unified_cap, unified_cpu, adapter_size)
     policy = POLICIES[policy_name]()
-    sim = ContinuousBatchSim(reqs, convos, cache, policy, max_loras)
+    sim = ContinuousBatchSim(reqs, convos, cache, policy, max_loras, hw=hw)
     sim.run()
     lats = [r.latency() for r in sim.finished]
     ttfts = list(sim.ttft.values())
@@ -806,10 +826,29 @@ def main():
                     help="unified pool MB. Working set ~12*adapter + ~1000 KV.")
     ap.add_argument("--unified-cpu", type=float, default=0.0)
     ap.add_argument("--max-loras", type=int, nargs="+", default=[12, 7, 5, 3])
+    ap.add_argument("--hw", default="ours",
+                    choices=["ours", "elora", "elora-aggressive", "elora-conservative"],
+                    help="hardware profile: OURS (~A10, PCIe 40GB/s) or ELORA's "
+                         "H800 regime (PCIe 128GB/s, faster HBM). See core.py.")
+    ap.add_argument("--pcie-ms-per-mb", type=float, default=None,
+                    help="override the profile's PCIe cost")
+    ap.add_argument("--decode-ms-per-token", type=float, default=None)
+    ap.add_argument("--prefill-ms-per-token", type=float, default=None)
+    ap.add_argument("--swap-cold-ms", type=float, default=None)
     args = ap.parse_args()
 
+    hw = get_profile(args.hw)
+    _ov = {}
+    if args.pcie_ms_per_mb is not None: _ov["pcie_ms_per_mb"] = args.pcie_ms_per_mb
+    if args.decode_ms_per_token is not None: _ov["decode_ms_per_token"] = args.decode_ms_per_token
+    if args.prefill_ms_per_token is not None: _ov["prefill_ms_per_token"] = args.prefill_ms_per_token
+    if args.swap_cold_ms is not None: _ov["swap_cold_ms"] = args.swap_cold_ms
+    if _ov:
+        hw = _replace(hw, **_ov)
+
     print(__doc__)
-    print(f"continuous batching | adapter={args.adapter_mb:.0f}MB "
+    print(f"continuous batching | hw={hw.name} pcie={hw.pcie_ms_per_mb:.4f} "
+          f"decode={hw.decode_ms_per_token:.2f} | adapter={args.adapter_mb:.0f}MB "
           f"| KV GPU {args.kv_gpu:.0f}MB | mean of {SEEDS} seeds\n")
 
     pools = ["separate", "unified"] if args.pool == "both" else [args.pool]
@@ -829,7 +868,8 @@ def main():
                 m = avg(pool=pool, max_loras=ml, policy_name=pol,
                         adapter_size=args.adapter_mb, kv_gpu_mb=args.kv_gpu,
                         adapter_cpu=args.adapter_cpu, kv_cpu=args.kv_cpu,
-                        unified_cap=args.unified_cap, unified_cpu=args.unified_cpu)
+                        unified_cap=args.unified_cap, unified_cpu=args.unified_cpu,
+                        hw=hw)
                 print(f"{ml:>9} {pol:>11} {m['p50']:>8.0f} {m['p95']:>9.0f}"
                       f" {m['ttft_p50']:>9.0f} {m['tpot']:>7.2f} {m['stale']:>8.1f}%"
                       f" {m['disk']:>6.0f} {m['kv_recompute']:>9.0f}")

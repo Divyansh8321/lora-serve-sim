@@ -5,9 +5,13 @@ discrete-event simulation of resource usage (memory + time), not of text.
 """
 
 import random
+from dataclasses import dataclass, replace
 
 
 # --- calibrated constants (see README for sources) ---
+# These are the "OURS" hardware regime: a single ~A10-class GPU (24-40 GB HBM,
+# PCIe ~40 GB/s). Phases 5-7 can override them via a HardwareProfile (below) so
+# the ELORA comparison can be run at ELORA's H800 regime apples-to-apples.
 MB_PER_TOKEN = 0.125      # 8B model, GQA, fp16: 2*32layers*8heads*128dim*2bytes
 # ADAPTER_MB: rank-32 LoRA on Llama-3.1-8B, all 7 linear targets
 # (q,k,v,o,gate,up,down). Per-principles: 32 layers * [4*(4096*32+32*4096) +
@@ -22,6 +26,81 @@ DECODE_MS_PER_TOKEN = 12      # bandwidth-bound, one full pass per token
 SWAP_COLD_MS = 300        # adapter load from disk / object storage
 SWAP_WARM_MS = 30         # adapter load from CPU RAM
 PCIE_MS_PER_MB = 0.105    # 40GB/s bandwidth + ~10us dispatch per 128KB chunk
+
+
+# --------------------------------------------------------------------------
+# Hardware profiles -- for apples-to-apples ELORA comparison (phases 5-7)
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    """A bundle of the time constants that vary with the serving GPU, plus
+    three phase-7 engine-behaviour switches that model what ELORA's runtime
+    actually does (CUDA-stream overlapped swaps, evict-on-full not proactively).
+
+    mb_per_token and adapter_mb are MODEL ARCHITECTURE, not hardware -- they are
+    held IDENTICAL across every profile. They live here only so a phase that
+    already threads adapter size (phase 5's --adapter-mb) has one place to read
+    it. The RadixNode.mb() / _resident_mb sites in phases 6-7 stay on the bare
+    global since they never change.
+    """
+    name: str
+    mb_per_token: float
+    adapter_mb: float
+    prefill_ms_per_token: float
+    decode_ms_per_token: float
+    swap_cold_ms: float            # adapter load from disk/object store -- NOT a GPU property, held constant
+    swap_warm_ms: float            # adapter load from CPU RAM over PCIe -- scales with PCIe
+    pcie_ms_per_mb: float
+    # phase-7 engine-behaviour knobs; --hw sets them as a bundle, per-switch
+    # flags override individually for one-at-a-time attribution.
+    swap_mode: str = "sync"           # "sync" | "async" (transfer overlaps inference)
+    prefetch_cost: str = "charged"    # "charged" | "overlapped"
+    swap_out_when: str = "highwater"  # "highwater" | "full"
+
+
+OURS = HardwareProfile(
+    name="ours",
+    mb_per_token=MB_PER_TOKEN, adapter_mb=ADAPTER_MB,
+    prefill_ms_per_token=PREFILL_MS_PER_TOKEN, decode_ms_per_token=DECODE_MS_PER_TOKEN,
+    swap_cold_ms=SWAP_COLD_MS, swap_warm_ms=SWAP_WARM_MS, pcie_ms_per_mb=PCIE_MS_PER_MB,
+)
+
+# ELORA: NVIDIA H800, 80 GB HBM, PCIe 5.0 @ 128 GB/s (Table II). HBM BW ~3.35
+# TB/s vs our implied ~600 GB/s. decode/prefill scaling is a BAND -- we report
+# both an aggressive (spec-sheet HBM/FLOP ratio) and conservative estimate,
+# since it is the single biggest lever on whether the swapper crosses zero.
+_ELORA_COMMON = dict(
+    name="elora", mb_per_token=MB_PER_TOKEN, adapter_mb=ADAPTER_MB,
+    swap_cold_ms=SWAP_COLD_MS,                       # disk/S3 latency, unchanged
+    swap_warm_ms=SWAP_WARM_MS * (0.008 / 0.105),     # PCIe-bound -> scales with PCIe
+    pcie_ms_per_mb=0.008,                            # PCIe 5.0 @ 128 GB/s + dispatch
+    swap_mode="async", prefetch_cost="overlapped", swap_out_when="full",
+)
+ELORA_AGGRESSIVE = HardwareProfile(
+    **_ELORA_COMMON,
+    prefill_ms_per_token=PREFILL_MS_PER_TOKEN * 0.13,
+    decode_ms_per_token=DECODE_MS_PER_TOKEN * 0.18,
+)
+ELORA_CONSERVATIVE = replace(
+    ELORA_AGGRESSIVE,
+    prefill_ms_per_token=PREFILL_MS_PER_TOKEN * 0.30,
+    decode_ms_per_token=DECODE_MS_PER_TOKEN * 0.35,
+)
+
+PROFILES = {
+    "ours": OURS,
+    "elora": ELORA_AGGRESSIVE,
+    "elora-aggressive": ELORA_AGGRESSIVE,
+    "elora-conservative": ELORA_CONSERVATIVE,
+}
+
+
+def get_profile(x):
+    """Accept a HardwareProfile, or a name string from PROFILES."""
+    if isinstance(x, HardwareProfile):
+        return x
+    return PROFILES[x]
 
 
 class Request:
