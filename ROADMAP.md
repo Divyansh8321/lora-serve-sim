@@ -329,8 +329,17 @@ under burstiness, that itself is the finding — and it matches ELORA's framing
    sharing".
 4. **Phase 7** (cost swapper + `--hw` profiles) — DONE. The swapper is
    net-negative at our engine, net-positive at ELORA's; `--swap-out-when full`
-   (a policy choice) carries the flip, not any hardware constant.
-5. **GPU validation run** — once phase 5 exists, run `validation/run_sweep.sh`
+   (a policy choice) carries the flip, not any hardware constant. Confirmed
+   continuous (not just two-point) with `--sweep-scale`.
+5. **Real-trace validation** (`real_traces.py`, `run_on_real_traces.py`) —
+   DONE, no GPU needed. Real Mooncake prefix-sharing + real BurstGPT arrivals.
+   Found the real trace is far more long-tailed than our synthetic Zipf
+   assumption (7,373 adapters, most used once), that the phase-6 pathology
+   reproduces and lands in ELORA's own reported range (38-58% stale KV vs
+   their 42-49%), and that phase 7's swapper effect shrinks to noise on real
+   arrival timing (our synthetic bursts were sharper than BurstGPT's real
+   ones). See REAL_DATA_FINDINGS.md.
+6. **GPU validation run** — once phase 5 exists, run `validation/run_sweep.sh`
    and compare against phase 5, not phase 2. Still pending real hardware.
 
 Each checkpoint is a commit + a docstring finding in the house style. No phase

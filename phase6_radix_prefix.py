@@ -161,7 +161,9 @@ class RadixTree:
         self.roots = {}                   # (adapter_id, group) -> prefix RadixNode
         self.convo_leaf = {}              # cid -> RadixNode (its continuation)
         self.resident = set()             # id(node) for nodes whose KV is on GPU
-        self._nodes = []                  # every node ever created (small: <100)
+        self._resident_nodes = {}         # id(node) -> node, for O(residents) scans
+        self._nodes = []                  # every node ever created (can be large:
+                                          # real traces create thousands)
         self._resident_mb = 0.0           # kept incrementally
 
     # ---- structure ----
@@ -193,11 +195,13 @@ class RadixTree:
     def make_resident(self, node):
         if id(node) not in self.resident:
             self.resident.add(id(node))
+            self._resident_nodes[id(node)] = node
             self._resident_mb += node.mb()
 
     def evict(self, node):
         if id(node) in self.resident:
             self.resident.discard(id(node))
+            self._resident_nodes.pop(id(node), None)
             self._resident_mb -= node.mb()
 
     def resize(self, node, new_tokens):
@@ -211,6 +215,11 @@ class RadixTree:
 
     def _all_nodes(self):
         return self._nodes
+
+    def resident_nodes(self):
+        """O(residents), not O(all nodes ever created) -- the eviction
+        policies below only ever want nodes currently on GPU."""
+        return self._resident_nodes.values()
 
     # ---- the match: how much of this request's prompt is already on GPU ----
     def matched_mb(self, cid, adapter_id, group, prefix_tokens, history_tokens):
@@ -295,9 +304,8 @@ class LRULeaf(Policy):
     def choose_evictions(self, tree, adapters_mb, need_mb, pinned_adapters,
                          pinned_nodes):
         ev, freed = [], 0.0
-        leaves = [n for n in tree._all_nodes()
-                  if tree.is_resident(n) and n.is_leaf()
-                  and id(n) not in pinned_nodes]
+        leaves = [n for n in tree.resident_nodes()
+                  if n.is_leaf() and id(n) not in pinned_nodes]
         for n in sorted(leaves, key=lambda x: x.last_used):
             if freed >= need_mb:
                 return ev
@@ -318,8 +326,7 @@ class OrderingOnly(Policy):
     def choose_evictions(self, tree, adapters_mb, need_mb, pinned_adapters,
                          pinned_nodes):
         ev, freed = [], 0.0
-        kv = [n for n in tree._all_nodes()
-              if tree.is_resident(n) and id(n) not in pinned_nodes]
+        kv = [n for n in tree.resident_nodes() if id(n) not in pinned_nodes]
         for n in sorted(kv, key=lambda x: (-x.mb(), x.last_used)):
             if freed >= need_mb:
                 return ev
@@ -343,18 +350,17 @@ class DepAware(Policy):
     name = "dep-aware"
 
     def _subtree_recent_kv(self, tree, adapter_id, now, horizon=20000):
-        for n in tree._all_nodes():
+        for n in tree.resident_nodes():
             if n.adapter_id != adapter_id:
                 continue
-            if tree.is_resident(n) and (now - n.last_used) < horizon:
+            if (now - n.last_used) < horizon:
                 return True
         return False
 
     def choose_evictions(self, tree, adapters_mb, need_mb, pinned_adapters,
                          pinned_nodes, now=0.0):
         ev, freed = [], 0.0
-        kv = [n for n in tree._all_nodes()
-              if tree.is_resident(n) and id(n) not in pinned_nodes]
+        kv = [n for n in tree.resident_nodes() if id(n) not in pinned_nodes]
 
         def rank(n):
             stale = self._adapter_resident(tree, adapters_mb, n.adapter_id)
@@ -463,8 +469,8 @@ class RadixSim:
         if total == 0:
             return 0.0
         stale = 0.0
-        for n in self.tree._all_nodes():
-            if self.tree.is_resident(n) and n.adapter_id not in self.adapters_mb:
+        for n in self.tree.resident_nodes():
+            if n.adapter_id not in self.adapters_mb:
                 stale += n.mb()
         return 100.0 * stale / total
 

@@ -103,6 +103,19 @@ FINDING (mean over 5 seeds, pool 2400MB, prefix 400 tok, 60s drift).
   cause is the PROACTIVE-EVICTION POLICY CHOICE. ELORA's "evict only when full"
   is what avoids the churn; async swap compounds it.
 
+  CONTINUOUS compute-speed sweep (--sweep-scale, decode+prefill scaled
+  TOGETHER as one "how much faster is the GPU" dial, 1.0x=ours down to
+  0.1x=10x faster) confirms this is not a two-point artifact:
+    burst x10 : -21% (1x) -> -104% (~4.6x, WORST) -> -75-80% (10x). Never
+                crosses zero at any speed tried.
+    burst x5  : gap shrinks monotonically, -17% -> -6%, approaching but
+                never reaching zero.
+    steady    : gap shrinks monotonically, -5% -> -2%, same pattern.
+  Compute speed alone never rescues the proactive-eviction policy, at any
+  burst level or any speed -- confirming --swap-out-when full is genuinely
+  the causal switch, not an artifact of only checking the two discrete
+  aggressive/conservative endpoints.
+
   - swap-noprefetch (-17.8% at x5, ours): confirms the proactive swap-out is
     the harm, not prefetch.
   - swap-wo-freq / swap-wo-swap within 0.5% of swap-full: no cost-model term
@@ -116,10 +129,19 @@ FINDING (mean over 5 seeds, pool 2400MB, prefix 400 tok, 60s drift).
   net-positive. Our earlier negative combined a synchronous, proactively-
   evicting model with A10-class hardware -- three mismatches, each now measured.
 
+REAL-DATA CHECK: run_on_real_traces.py replays real Mooncake conversations
+  (real prefix-sharing) with real BurstGPT arrival timing instead of this
+  file's synthetic bursty workload. Direction still matches (negative at
+  --hw ours, ~zero-to-positive at --hw elora) but the MAGNITUDE collapses to
+  noise (-0.7% -> +0.1%, vs double digits here) -- our synthetic bursts are
+  sharper/more favorable-to-testing than BurstGPT's real, messier ones. See
+  REAL_DATA_FINDINGS.md.
+
 Run:  python phase7_cost_swapper.py
       python phase7_cost_swapper.py --hw elora-aggressive --burst 1 5 10
       python phase7_cost_swapper.py --sweep --hw-list ours --burst 10
       python phase7_cost_swapper.py --sweep-const swap-cold --sweep-range 10 300 8 --burst 10
+      python phase7_cost_swapper.py --sweep-scale --sweep-range 1.0 0.1 10 --burst 10
 """
 
 import argparse
@@ -189,6 +211,7 @@ class RadixTree:
         self.roots = {}
         self.convo_leaf = {}
         self.resident = set()
+        self._resident_nodes = {}         # id(node) -> node, O(residents) scans
         self._nodes = []
         self._resident_mb = 0.0
 
@@ -219,11 +242,13 @@ class RadixTree:
     def make_resident(self, n):
         if id(n) not in self.resident:
             self.resident.add(id(n))
+            self._resident_nodes[id(n)] = n
             self._resident_mb += n.mb()
 
     def evict(self, n):
         if id(n) in self.resident:
             self.resident.discard(id(n))
+            self._resident_nodes.pop(id(n), None)
             self._resident_mb -= n.mb()
 
     def resize(self, n, new_tokens):
@@ -236,6 +261,10 @@ class RadixTree:
 
     def all_nodes(self):
         return self._nodes
+
+    def resident_nodes(self):
+        """O(residents), not O(all nodes ever created)."""
+        return self._resident_nodes.values()
 
     def shared_by(self, n):
         return max(1, len(n.children)) if n.is_prefix else 1
@@ -318,8 +347,8 @@ class SwapCostModel(Policy):
         # and few adapters are resident, protect it a bit
         floor = 0.0
         if not n.is_prefix:
-            same = sum(1 for m in sim.tree.all_nodes()
-                       if m.adapter_id == n.adapter_id and sim.tree.is_resident(m))
+            same = sum(1 for m in sim.tree.resident_nodes()
+                       if m.adapter_id == n.adapter_id)
             if same <= 1 and len(sim.adapters_mb) <= sim.max_loras:
                 floor = 1.0
         # orphaned KV (adapter already gone) is worthless -> large negative
@@ -457,15 +486,13 @@ class Phase7Sim:
         total = self.tree.resident_mb()
         if total == 0:
             return 0.0
-        stale = sum(n.mb() for n in self.tree.all_nodes()
-                    if self.tree.is_resident(n)
-                    and n.adapter_id not in self.adapters_mb)
+        stale = sum(n.mb() for n in self.tree.resident_nodes()
+                    if n.adapter_id not in self.adapters_mb)
         return 100.0 * stale / total
 
     # ---------- eviction ----------
     def _evict_to(self, target_free, protect_nodes, protect_adapters):
-        cands = [n for n in self.tree.all_nodes()
-                 if self.tree.is_resident(n) and id(n) not in protect_nodes]
+        cands = [n for n in self.tree.resident_nodes() if id(n) not in protect_nodes]
         for n in self.policy.rank_reactive(self, cands):
             if self.free_mb() >= target_free - 1e-9:
                 return
@@ -808,15 +835,18 @@ _CONST_FIELD = {
 }
 
 
+def _sweep_values(lo, hi, n):
+    ratio = (hi / lo) ** (1.0 / (n - 1)) if n > 1 else 1.0
+    return [lo * ratio ** i for i in range(n)]
+
+
 def run_sweep_const(args):
     """Vary ONE hardware constant across a geometric range; find the sign flip."""
     field = _CONST_FIELD[args.sweep_const]
     lo, hi, n = args.sweep_range
-    n = int(n)
-    ratio = (hi / lo) ** (1.0 / (n - 1)) if n > 1 else 1.0
-    vals = [lo * ratio ** i for i in range(n)]
+    vals = _sweep_values(lo, hi, int(n))
     base_hw = _build_hw(args.hw, _cli_overrides(args))
-    print(f"SWEEP-CONST {field}  from {lo:g} to {hi:g} ({n} pts, geometric)")
+    print(f"SWEEP-CONST {field}  from {lo:g} to {hi:g} ({int(n)} pts, geometric)")
     print(f"start hw={base_hw.name} | burst {args.burst[0]:.0f} | pool "
           f"{args.pool_mb:.0f}MB | prefix {args.prefix_tokens} tok | "
           f"{args.sweep_policy} vs {args.sweep_baseline} | mean of {SEEDS} seeds\n")
@@ -851,6 +881,62 @@ def run_sweep_const(args):
               f"{args.sweep_policy} stays {'positive' if prev[1] >= 0 else 'negative'}.")
 
 
+def run_sweep_scale(args):
+    """Vary a single COMPUTE SCALE FACTOR that moves decode_ms_per_token AND
+    prefill_ms_per_token together, proportionally -- this is what "how much
+    faster is the GPU" actually means (a real GPU doesn't get faster at
+    decode without also getting faster at prefill). scale=1.0 is `ours`;
+    scale=0.18 matches ELORA_AGGRESSIVE's decode ratio, scale=0.35 matches
+    ELORA_CONSERVATIVE's. Finer-grained than the two-point aggressive/
+    conservative split -- this answers "exactly how much hardware speedup is
+    needed before the sign flips", not just "does either endpoint flip it".
+    PCIe and the engine switches (swap-mode/prefetch/swap-out) are held at
+    --hw's value throughout, so this isolates compute speed specifically.
+    """
+    lo, hi, n = args.sweep_range
+    vals = _sweep_values(lo, hi, int(n))
+    base_hw = _build_hw(args.hw, _cli_overrides(args))
+    print(f"SWEEP-SCALE compute factor (decode & prefill scaled together)  "
+          f"from {lo:g}x to {hi:g}x ({int(n)} pts, geometric)")
+    print(f"start hw={base_hw.name} (decode={base_hw.decode_ms_per_token:.3f} "
+          f"prefill={base_hw.prefill_ms_per_token:.4f}) | burst {args.burst[0]:.0f} "
+          f"| pool {args.pool_mb:.0f}MB | prefix {args.prefix_tokens} tok | "
+          f"{args.sweep_policy} vs {args.sweep_baseline} | mean of {SEEDS} seeds\n")
+    print(f"{'scale':>8} {'decode ms':>10} {'prefill ms':>11} "
+          f"{args.sweep_policy:>12} {args.sweep_baseline:>12} {'delta%':>9} {'sign':>5}")
+    print("-" * 72)
+    bf = args.burst[0]
+    prev = None
+    crossover = None
+    for scale in vals:
+        hw = _replace(base_hw,
+                     decode_ms_per_token=base_hw.decode_ms_per_token * scale,
+                     prefill_ms_per_token=base_hw.prefill_ms_per_token * scale)
+        pol = avg(burst_factor=bf, policy_name=args.sweep_policy,
+                  pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                  max_loras=args.max_loras, drift_period=args.drift_period, hw=hw)
+        bas = avg(burst_factor=bf, policy_name=args.sweep_baseline,
+                  pool_mb=args.pool_mb, prefix_tokens=args.prefix_tokens,
+                  max_loras=args.max_loras, drift_period=args.drift_period, hw=hw)
+        d = _delta(bas["p50"], pol["p50"])
+        print(f"{scale:>8.3f} {hw.decode_ms_per_token:>10.3f} "
+              f"{hw.prefill_ms_per_token:>11.4f} {pol['p50']:>12.0f} "
+              f"{bas['p50']:>12.0f} {d:>+8.1f}% {'+' if d >= 0 else '-':>5}")
+        if prev is not None and (prev[1] < 0) != (d < 0):
+            (s0, d0), (s1, d1) = prev, (scale, d)
+            crossover = s0 + (s1 - s0) * (0 - d0) / (d1 - d0)
+        prev = (scale, d)
+    print()
+    print("Reference points: ELORA_AGGRESSIVE ~ 0.18x, ELORA_CONSERVATIVE ~ 0.35x")
+    if crossover is not None:
+        print(f"VERDICT: {args.sweep_policy} crosses zero at compute scale ~= "
+              f"{crossover:.3f}x (interp, burst x{bf:.0f}).")
+    else:
+        print(f"VERDICT: no sign flip across {lo:g}x-{hi:g}x -- "
+              f"{args.sweep_policy} stays {'positive' if prev[1] >= 0 else 'negative'} "
+              f"at every compute speed tried.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -881,6 +967,12 @@ def main():
                              "swapout", "all"])
     ap.add_argument("--sweep-const", choices=list(_CONST_FIELD),
                     help="vary ONE constant across --sweep-range; find the crossover")
+    ap.add_argument("--sweep-scale", action="store_true",
+                    help="vary a combined compute-speed factor (decode+prefill "
+                         "scaled together) across --sweep-range LO HI N (as "
+                         "multipliers, e.g. 1.0 0.1 10); finds the exact "
+                         "hardware-speedup crossover instead of just testing "
+                         "the aggressive/conservative endpoints")
     ap.add_argument("--sweep-range", type=float, nargs=3, default=[0.008, 0.105, 9],
                     metavar=("LO", "HI", "N"))
     ap.add_argument("--sweep-policy", default="swap-full")
@@ -892,6 +984,9 @@ def main():
         return
     if args.sweep_const:
         run_sweep_const(args)
+        return
+    if args.sweep_scale:
+        run_sweep_scale(args)
         return
 
     hw = _build_hw(args.hw, _cli_overrides(args))

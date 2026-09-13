@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 validation/results/
 elora.txt
+traces/*.jsonl
+traces/*.csv

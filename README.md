@@ -6,8 +6,10 @@ one GPU. **Seven phases**, each adding one variable, ending with a from-scratch
 reconstruction of ELORA's full architecture.
 
 **Headline.** The stale-KV pathology that motivates ELORA/FastLibra (HPCA 2026)
-is **real and reproducible** (we measure 44–50% invalid KV vs. their 42–49%).
-But decomposing their fix into levers their own ablations don't separate:
+is **real and reproducible** — on synthetic workloads (44–50% invalid KV vs.
+their 42–49%) **and on a real production trace** (38–58%, see
+`REAL_DATA_FINDINGS.md`). But decomposing their fix into levers their own
+ablations don't separate:
 
 - **Pool unification does the heavy lifting** (−7% p50, staleness → 0). A
   cross-pool *signal* without unification moves the staleness metric but not
@@ -51,8 +53,16 @@ Pure standard library. No GPU, no model, no network.
 elora-conservative}` — `ours` is a single ~A10 (PCIe 40 GB/s); `elora` is the
 H800 regime (PCIe 128 GB/s, ~3.35 TB/s HBM, async overlapped swaps, evict-on-
 full). This makes the ELORA comparison apples-to-apples. `phase7` also has
-`--sweep` (which engine switch flips the swapper's sign) and `--sweep-const`
-(does any hardware constant alone), plus `sweeps/*.py` as standalone artifacts.
+`--sweep` (which engine switch flips the swapper's sign), `--sweep-const` (does
+any single hardware constant alone), `--sweep-scale` (a continuous compute-
+speed dial, not just the two aggressive/conservative points), plus
+`sweeps/*.py` as standalone artifacts.
+
+**Real production traces.** `real_traces.py` + `run_on_real_traces.py` replay
+phases 6 and 7 against real data instead of our synthetic formulas: real
+prefix-sharing structure (Mooncake FAST'25 trace) and real bursty arrival
+timing (BurstGPT, CC-BY-4.0) — both free, public, no GPU needed. See
+`REAL_DATA_FINDINGS.md`.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
@@ -340,10 +350,14 @@ is exactly `0.025` (40 GB/s) + `0.080` (10 µs dispatch per 128 KB).
 Things this project has *not* earned the right to claim yet, stated plainly so a
 reader can calibrate:
 
-1. **One workload family.** Phases 2–6: 40 conversations, 12 adapters, Zipf
-   skew 1.0, 5 turns, 6 s gaps, Poisson arrivals. Phase 6 adds shared prefixes;
-   phase 7 adds bursts + drifting popularity (`make_bursty_workload`) — a
-   synthetic stand-in for the Azure Function trace, not the trace itself.
+1. **One synthetic workload family for phases 2–5.** 40 conversations, 12
+   adapters, Zipf skew 1.0, 5 turns, 6 s gaps, Poisson arrivals. Phase 6's
+   shared prefixes and phase 7's bursts + drift were originally synthetic
+   stand-ins for real traffic — **now also tested against real data** (see
+   #8 below and `REAL_DATA_FINDINGS.md`), which found the real trace is far
+   *more* long-tailed (7,373 distinct adapters, most used once) than our
+   synthetic Zipf(1.0) assumption, and that real bursts move phase 7's numbers
+   much less than our synthetic ones did.
 2. **Batch-at-a-time in phases 1–4.** Phases 5–7 add continuous batching.
    Phases 1–4 keep the simpler model on purpose — each isolates one variable.
 3. **The 60% rescue figure is an estimate.** Not measured in-sim.
@@ -358,11 +372,20 @@ reader can calibrate:
    unified-pool results got stronger (see Calibration).
 7. **The `ELORA_*` hardware profiles are estimates.** PCIe is a solid figure
    (128 GB/s, from the paper); the decode/prefill scaling is a swept
-   *aggressive/conservative band*, not a measured value. And even the H800
-   profile keeps our batch-at-a-time step model and synthetic bursts — so
-   phase 7's "swapper flips positive at ELORA's engine" is the *direction*
-   ELORA reports, at a plausible constant band, not a reproduction of their
-   1.42×.
+   *aggressive/conservative band*, not a measured value, now also confirmed
+   continuous with `--sweep-scale` (never crosses zero at any speed tried —
+   not just the two endpoints). And even the H800 profile keeps our
+   batch-at-a-time step model — so phase 7's "swapper flips positive at
+   ELORA's engine" is the *direction* ELORA reports, at a plausible constant
+   band, not a reproduction of their 1.42×.
+8. **Real-trace results (see `REAL_DATA_FINDINGS.md`) mix two different real
+   systems.** BurstGPT's arrivals (real Azure OpenAI traffic) are overlaid
+   onto Mooncake's conversations (a real, different Kimi/Moonshot deployment)
+   — the best available combination of two real signals, not one ground-truth
+   trace. Adapter identity is inferred from Mooncake's shared-prompt structure
+   (defensible, not measured). `lru-leaf`'s multi-hour real-trace latency is a
+   genuine simulator output (verified, not a bug) but not a literal production
+   forecast — a real system would shed load long before that point.
 
 ## Limitations
 
@@ -371,7 +394,8 @@ reader can calibrate:
 | continuous batching | one persistent rolling batch; adapters pinned to in-flight sequences | ✅ **phase 5** |
 | prefix caching / RadixAttention | SGLang/ELORA match longest shared prefix at any depth | ✅ **phase 6** (coarse) |
 | cost-model swapper | ELORA re-scores every cache node every 100ms (swap cost + freq + LRU term) | ✅ **phase 7** |
-| bursty / drifting workload | Azure Function trace; adapter popularity shifts over time | ✅ **phase 7** (`make_bursty_workload`) |
+| bursty / drifting workload | Azure Function trace; adapter popularity shifts over time | ✅ **phase 7** (`make_bursty_workload`); ✅ real BurstGPT trace (`run_on_real_traces.py`) |
+| real prefix-sharing structure | actual shared system-prompt overlap across users | ✅ real Mooncake trace (`run_on_real_traces.py`) |
 | reclaim pool | vLLM V1 frees blocks lazily; a request returning before reuse pays nothing | — |
 | remote KV tiers | LMCache backends: Redis/Valkey, Mooncake, NVMe, S3 | — |
 | multi-node routing | biggest real-world lever; invisible to a single-node model | — |
@@ -409,3 +433,9 @@ their real one". Full detail in `ROADMAP.md`.
 - **ConServe** — request-granularity eviction, "coarse-grained fate-sharing"
 - **FastSwitch** — swap granularity and `cudaMemcpyAsync` dispatch overhead
 - **Predibase LoRAX** — Tiered Weight Caching, Adapter Exchange Scheduling
+- **Mooncake FAST'25 trace** (github.com/kvcache-ai/Mooncake) — real anonymized
+  request trace with prefix-block hash IDs for studying KV-cache sharing; used
+  in `real_traces.py` / `REAL_DATA_FINDINGS.md`
+- **BurstGPT** (github.com/HPMLL/BurstGPT, CC-BY-4.0) — 10M+ real ChatGPT/GPT-4
+  request logs from Azure OpenAI with real arrival timestamps; used for real
+  bursty-arrival timing in `real_traces.py`
