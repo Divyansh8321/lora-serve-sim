@@ -59,10 +59,15 @@ speed dial, not just the two aggressive/conservative points), plus
 `sweeps/*.py` as standalone artifacts.
 
 **Real production traces.** `real_traces.py` + `run_on_real_traces.py` replay
-phases 6 and 7 against real data instead of our synthetic formulas: real
-prefix-sharing structure (Mooncake FAST'25 trace) and real bursty arrival
-timing (BurstGPT, CC-BY-4.0) — both free, public, no GPU needed. See
-`REAL_DATA_FINDINGS.md`.
+phases 6 and 7 against real data on **two independent real workloads**
+(`--workload mooncake|taskmaster`) instead of our synthetic formulas — real
+prefix-sharing structure (Mooncake FAST'25 trace), a real task-type adapter
+population (Google Taskmaster — **one of ELORA's own three evaluation
+datasets**), and real bursty arrival timing (BurstGPT, CC-BY-4.0) — all free,
+public, no GPU needed. Key finding: **the stale-KV pathology is
+traffic-shape-dependent** — it reproduces severely on Mooncake's long-tailed
+adapter population, but never appears at all on Taskmaster's moderate,
+skewed one, at any pool/slab size tried. See `REAL_DATA_FINDINGS.md`.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See

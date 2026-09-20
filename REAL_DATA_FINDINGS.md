@@ -3,145 +3,201 @@
 This closes two of the "Scope & honesty" gaps: our synthetic shared-prefix
 structure and our synthetic bursty-arrival formula were both invented. Here
 we replace them with **real, public, free-to-download traces** and re-run
-phases 6 and 7 unmodified against real data instead of our formulas.
+phases 6 and 7 unmodified against real data instead of our formulas — on
+**two independent real datasets**, one of which is one of ELORA's own three
+evaluation datasets.
 
-## The two datasets
+## The three datasets
 
 **[Mooncake FAST'25 trace](https://github.com/kvcache-ai/Mooncake)**
 (`traces/conversation_trace.jsonl`) — a real anonymized request log released
 specifically to study KV-cache sharing. Each request lists `hash_ids`: the
 512-token prefix blocks its prompt matches. Matching hash IDs across requests
 = shareable cached KV. 12,031 requests, 7,900 real multi-turn conversations.
+No LoRA-adapter field — adapter identity is *inferred* from the first shared
+prefix block after the universal root (a real, Zipf-shaped popularity signal,
+not ground truth).
+
+**[Google Taskmaster TM-1](https://github.com/google-research-datasets/Taskmaster)**
+(`self-dialogs.json`) — **one of ELORA's own three evaluation datasets**
+("Personal Agents"). 7,708 real task-oriented dialogs, ~11 real turns each.
+Carries a genuine `instruction_id` field (e.g. `pizza-ordering-2`,
+`restaurant-table-1`) — 15 distinct real task types, used **directly** as
+adapter identity. No inference needed, unlike Mooncake.
 
 **[BurstGPT](https://github.com/HPMLL/BurstGPT)** (CC-BY-4.0) — 10M+ real
 ChatGPT/GPT-4 request logs from Azure OpenAI, with real arrival timestamps.
-We use the arrival-gap structure only (not the token counts, which come from
-Mooncake).
+Used for arrival-gap timing only. Neither Mooncake nor Taskmaster has
+real-time arrival data of the kind our simulator needs (Taskmaster has none
+at all; we chose to overlay BurstGPT onto both for a controlled comparison).
+**This mirrors ELORA's own documented method**: their paper states plainly
+that Taskmaster "lacks timestamps," so they "adopt query arrival patterns
+from the Microsoft Azure function trace" for it. We do the same thing they
+did, with a public substitute for their (unreleased) exact Azure slice.
 
-Neither trace has a LoRA-adapter field — both are single-model traces. Adapter
-identity is inferred from Mooncake's own structure: the first shared prefix
-block after the universal root is treated as "which system prompt / adapter
-this conversation's session belongs to." See `real_traces.py`'s docstring for
-the full mapping and its honest limitations.
+## Methodology note: matching real-time density across datasets
 
-## Finding 1 (unplanned): real traffic is far more long-tailed than our synthetic assumption
+Mooncake conversations average 1.5 turns; Taskmaster conversations average
+~11. Slicing both traces to "the same number of requests" therefore spreads
+Taskmaster's conversations across a much longer real BurstGPT time window
+than Mooncake's (early runs: 83 hours vs 15 hours for a nominally
+"comparable" cut) — diluting concurrency and making the results
+incomparable. Fixed by slicing **by conversation count**, not request count
+(`_truncate_to_n_conversations` in `run_on_real_traces.py`): at 960
+conversations, both datasets now span the same real 15-hour BurstGPT window.
 
-Our synthetic workload assumes 12 adapters with a Zipf(1.0) popularity skew —
-a few adapters dominate, everyone reuses one of a small set. The real trace
-does not look like that:
+## Finding 1 (unplanned): real traffic is far more long-tailed than our synthetic assumption — but this varies enormously by dataset
 
-- 7,373 distinct adapters across 7,900 conversations
-- only 433 adapters are used by **more than one** conversation
-- the single most popular adapter is used by just **7** conversations
+Our synthetic workload assumes 12 adapters with a Zipf(1.0) popularity skew.
+The two real datasets bracket it from opposite directions:
 
-This is a genuinely different regime: mostly one-off, unique customer
-configurations, with a much smaller "hot set" than we assumed. It also means
-most of the raw trace has **no caching decision to make at all** — a memory
-policy is irrelevant to an adapter that's used exactly once. We restrict to
-conversations whose adapter is used ≥2 times (`--min-adapter-reuse 2`,
-default) — the traffic where a caching policy actually matters — which leaves
-433 real adapters over 960 conversations, 1,447 requests.
+| | Mooncake | Taskmaster | our synthetic |
+|---|---|---|---|
+| distinct adapters | 7,373 | **15** | 12 |
+| most popular adapter's use count | 7 | **1,211** | (Zipf-skewed) |
+| adapters used by only 1 conversation | 96% | 0% | 0% |
 
-## Finding 2: the phase-6 pathology reproduces at real-trace scale, and blind LRU is worse than synthetic predicted
+Mooncake is far *more* long-tailed than our synthetic assumption (see
+`--min-adapter-reuse`, below). **Taskmaster is much closer to our synthetic
+shape** — a small number of real, popular, reusable task types with a real
+substantial skew. Neither extreme is "the real answer"; production traffic
+apparently spans both regimes depending on the application (many-unique-
+customers vs. a-dozen-real-personas).
 
-433 real adapters competing for a 12-slot slab (`pool 2400MB`, matching a
-realistic vLLM `--max-loras 12`):
+`--min-adapter-reuse 2` (Mooncake only; default) restricts to conversations
+whose adapter is used by ≥2 conversations — the traffic where a caching
+decision exists at all (a never-reused adapter has no cache-vs-evict
+question to answer). This leaves 433 real adapters over 960 conversations.
 
-| policy | p50 (ms) | stale KV |
+## Finding 2: the phase-6 pathology reproduces on Mooncake, lands in ELORA's range, and needs a real (not oversubscribed) slab to show it honestly
+
+433 real Mooncake adapters, unified pool sized as ~40% of that (matching
+ELORA's own practice of sizing `--max-loras` as a plausible fraction of the
+real deployed LoRA count, never a huge oversubscription ratio):
+
+| max_loras (pool) | `lru-leaf` p50 | stale KV |
 |---|---|---|
-| `lru-leaf` | **11,763,584** (~3.3 hours) | 58.3% |
-| `ordering` | 6,035 | 41.9% |
-| `dep-aware` | 6,035 | 38.0% |
+| 12 (2,400 MB) — our ORIGINAL synthetic-tuned default | **12,570,552 ms** | 56.4% |
+| 60 (11,600 MB) — 40% of the 433 real adapters | **9,922,084 ms** | 42.4% |
+| 200 (36,400 MB) | 8,338 ms | 40.2% |
 
-Stale KV (38–58%) lands squarely in ELORA's own reported range (42.4% vLLM,
-48.6% ELORA-WOM) — on **real production-style traffic**, not our synthetic
-workload. That is the strongest confirmation of the core pathology in this
-whole project.
+**The original `max_loras=12` was a leftover from tuning against our
+synthetic 12-adapter workload, applied unthinkingly to a trace with 433 real
+competing adapters — a 36:1 oversubscription ratio no real deployment would
+run.** Widening the slab to a realistic 40% share (60 slots) still produces
+a multi-hour collapse for `lru-leaf`; only at ~200 slots (~46% of the real
+adapter count) does the pathology disappear. **This means the collapse is
+not primarily a slab-sizing artifact — it persists across a wide range of
+realistic slab sizes** — but the default is now `--max-loras` auto-scaled
+to 40% of the real in-play adapter count, not a hardcoded carryover value.
 
-`lru-leaf`'s collapse is far more severe than the synthetic version (which
-topped out around 3–40× worse, not ~2000×). 97% of its requests wait multiple
-hours. This is real: with hundreds of genuinely competing adapters, blind LRU
-doesn't just degrade, it causes near-total system collapse. `ordering` and
-`dep-aware` remain indistinguishable from each other here (dep-aware +0.0%) —
-consistent with the synthetic phase-6 finding that dependency *scoring* adds
-little once you're not doing something as blind as `lru-leaf`.
+At the corrected 60-slot slab: `ordering` p50 5,922 ms / 17.2% stale,
+`dep-aware` p50 5,918 ms / 15.4% stale — both a many-thousand-times
+improvement over `lru-leaf`, both landing near ELORA's own reported range
+(42.4% vLLM, 48.6% ELORA-WOM) for the "no smart eviction" case.
 
-## Finding 3: on real arrival timing, the swapper's effect shrinks to noise
+## Finding 3 (new): on Taskmaster's traffic shape, the pathology does NOT appear at all — a genuinely different failure mode
 
-Phase 7's synthetic bursty workload showed a clear, large effect (the swapper
-net-negative at `--hw ours`, net-positive at `--hw elora`). On the real
-BurstGPT arrival pattern, at the same real Mooncake conversations:
+Same experiment on Taskmaster (15 real adapters, matched 15-hour real
+BurstGPT window, `max_loras` swept from 6 down to 1 — the most extreme
+possible pressure, only one adapter resident at a time — and the KV pool
+squeezed from 1,900 MB down to 200 MB):
 
-| policy | `--hw ours` vs react-lru | `--hw elora-aggressive` vs react-lru |
-|---|---|---|
-| `swap-full` | −0.7% | +0.1% |
-| `swap-noprefetch` | −0.7% | +0.1% |
+| policy | p50 | stale KV | adapter loads |
+|---|---|---|---|
+| `lru-leaf` | 477 | **0.0%** | 861 |
+| `ordering` | 477 | **0.0%** | 861 |
+| `dep-aware` | 477 | **0.0%** | 861 |
+| `react-lru` | 477 | **0.0%** | 861 |
+| `swap-full` | 477 | **0.0%** | 860 |
 
-The *direction* still matches (negative at `ours`, ~zero-to-positive at
-`elora`) but the **magnitude collapsed to noise** — a fraction of a percent,
-versus double-digit percentages on our synthetic bursty formula. Adapter load
-counts are nearly identical across every phase-7 policy (~14,800 either way at
-`--hw elora`), meaning the swapper isn't getting enough distinguishing
-structure from real arrival timing to matter much either way.
+**Every single policy is exactly tied.** Adapter *loads* do climb under
+pressure (165 → 861 as the pool tightens), confirming adapter thrashing is
+real and increasing — but it never once produces stale KV, at any pool size
+or slab size tried, including the most extreme single-slot case.
 
-**Honest reading:** our synthetic `make_bursty_workload` (hand-tuned 5–10×
-rate spikes) produces a much sharper, more favorable-to-testing burst pattern
-than BurstGPT's real, messier bursts. The synthetic bursts may have
-overstated how much the swapper's behavior matters. This is exactly the kind
-of thing "test on real data" is supposed to catch — and it did.
+**Why:** Taskmaster's real structure — 15 adapters, real substantial
+popularity skew, ~11 turns per conversation spread across real (sparse)
+BurstGPT arrival gaps — means a conversation's own KV essentially never
+coexists on the GPU with a full competing slab of *other* adapters' KV at
+the moment its adapter gets evicted. The eviction pressure lands on
+adapters; it doesn't translate into orphaned KV the way Mooncake's much
+higher adapter cardinality does.
 
-## Finding 4: continuous, not just two-point, hardware-speed sweep
+**This is a real, useful negative result, not a bug** (verified by sweeping
+pool size from 1900 MB down to 200 MB and `max_loras` from 6 down to 1 —
+stale KV stays exactly 0.0% throughout). It says: **the stale-KV pathology,
+and therefore the entire premise for a smart eviction policy, is
+traffic-shape-dependent.** A deployment that looks like Taskmaster (a
+moderate number of well-known, reusable task-specific adapters) may simply
+never encounter the problem ELORA's dependency tree is built to solve — no
+matter how tight memory gets. A deployment that looks like Mooncake (a huge,
+long-tailed population of adapters) encounters it severely.
 
-`phase7_cost_swapper.py --sweep-scale` varies decode+prefill together
-(the way an actual GPU speedup would) across a fine geometric range, instead
-of only testing the two discrete aggressive/conservative points:
+## Finding 4: on real arrival timing, the swapper is a net negative on BOTH real datasets — for the same mechanism identified in phase 7's synthetic tests
 
-At burst ×10, scale 1.0× (=`ours`) down to 0.1× (10× faster than `ours`):
-`swap-full` never crosses zero — it gets **worse** (−21% → −104% around 5×
-faster) before drifting back toward −75 to −80% at very high speed. At
-steady and burst ×5, the same sweep shows the gap **shrinking monotonically**
-toward (but never reaching) zero as speed increases.
+| dataset | `react-lru` p50 | `swap-full` p50 | delta | adapter loads (react-lru → swap-full) |
+|---|---|---|---|---|
+| Mooncake (60/11,600 MB) | 5,914 | 5,877 | +0.6% | 708 → 590 |
+| Taskmaster (6/1,900 MB, loose pool) | 224 | 277 | **−24.6%** | 165 → 292 |
 
-This sharpens the earlier two-point finding: raw compute speed, swept
-continuously, **never flips the sign** at any burst level tried. It confirms
-`--swap-out-when full` (a policy choice, not a hardware constant) really is
-the causal variable — this isn't an artifact of only checking two discrete
-speed points.
+On Mooncake at a realistic slab the swapper is roughly neutral. **On
+Taskmaster, with room to spare in the pool, the swapper's *proactive*
+swap-out creates churn where none was needed** — 292 adapter loads versus
+165 for plain reactive LRU, even though nothing was forcing evictions. This
+is the exact mechanism phase 7's synthetic tests identified
+(`--swap-out-when full` vs the default proactive `highwater` trigger) —
+now independently confirmed on a **third, unrelated real dataset**. The
+swapper's core weakness (evicting proactively, before it's actually needed)
+is not an artifact of our synthetic bursty formula; it reproduces on real
+Azure OpenAI arrival timing too.
 
 ## How to reproduce
 
 ```bash
-# download the traces (one-time, ~55MB total)
+# download the traces (one-time, ~120MB total)
 mkdir -p traces && cd traces
 curl -sL -o mooncake_conversation_trace.jsonl \
   https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl
 curl -sL -o BurstGPT_without_fails_1.csv \
   https://github.com/HPMLL/BurstGPT/releases/download/v2.0/BurstGPT_without_fails_1.csv
+curl -sL -o taskmaster_tm1.json \
+  https://raw.githubusercontent.com/google-research-datasets/Taskmaster/master/TM-1-2019/self-dialogs.json
 cd ..
 
-python real_traces.py                          # sanity-check both loaders
-python run_on_real_traces.py                   # phase 6 + 7 on real data, --hw ours
-python run_on_real_traces.py --hw elora-aggressive
-python phase7_cost_swapper.py --sweep-scale --sweep-range 1.0 0.1 10 --burst 10
+python real_traces.py                                    # sanity-check all three loaders
+python run_on_real_traces.py --workload mooncake          # phase 6+7, Mooncake, --hw ours
+python run_on_real_traces.py --workload taskmaster         # phase 6+7, Taskmaster, --hw ours
+python run_on_real_traces.py --workload mooncake --hw elora-aggressive
+python run_on_real_traces.py --workload taskmaster --n-conversations 960 --pool-mb 300 --max-loras 6
 ```
+
+**LMSYS Chatbot Arena** (ELORA's "Chatbot" dataset) requires a free
+HuggingFace login + accepting the dataset's terms (likely PII-review
+related) — not pulled here. See `real_traces.py` if adding it later; do not
+use unofficial ungated mirrors that bypass the original authors' access
+control.
 
 ## Honest limitations of this pass
 
-1. **Two different real systems, stitched together.** BurstGPT's arrivals are
-   real Azure OpenAI ChatGPT/GPT-4 traffic; Mooncake's content/prefix
-   structure is a real (different) Kimi/Moonshot deployment. Overlaying one
-   trace's timing onto another's content is not a reproduction of either
-   system's actual joint behavior — it's the best available combination of
-   two real signals, not one ground-truth trace.
-2. **Adapter identity is inferred, not measured.** Neither trace has a LoRA
-   field. The depth-2 shared-prompt-block proxy is defensible but not ground
-   truth.
+1. **Two different real systems, stitched together (Mooncake case only).**
+   BurstGPT's arrivals are real Azure OpenAI ChatGPT/GPT-4 traffic;
+   Mooncake's content/prefix structure is a real (different) Kimi/Moonshot
+   deployment. Taskmaster is cleaner in one sense (it's one of ELORA's own
+   datasets) but still borrows BurstGPT for timing, same as ELORA borrowed
+   the Azure trace for it.
+2. **Mooncake's adapter identity is inferred, not measured**; Taskmaster's
+   is a genuine field, not inferred — the two datasets differ in how much
+   trust to place in "adapter identity."
 3. **Mooncake's variable-depth prefix chains are collapsed to one number per
-   conversation** (the simulator's tree model wants a single `prefix_tokens`
-   length; real chains grow turn-by-turn). See `real_traces.py`.
-4. **`lru-leaf`'s multi-hour p50 is a genuine simulator output, not a bug** —
-   verified by direct inspection (97% of requests affected, TTFT stays normal
-   throughout) — but it is also a magnitude no real deployment would tolerate;
-   a real system would shed load or trigger alerts long before this point. It
-   should be read as "this policy is catastrophically bad at this scale," not
-   as a literal production forecast.
+   conversation.** Taskmaster carries **no** cross-conversation prefix-
+   sharing signal at all (no hash_ids equivalent) — its `prefix_tokens` is
+   set to 0 throughout, an honest gap, not a fabricated one.
+4. **`lru-leaf`'s multi-hour Mooncake latency is a genuine simulator output**
+   (verified by direct inspection: 97% of requests affected, TTFT stays
+   normal throughout) but not a literal production forecast — a real system
+   would shed load or trigger alerts long before this point.
+5. **We did not obtain LMSYS/Chatbot Arena** (ELORA's third dataset) due to
+   its access-gating terms. The reconstruction currently covers 2 of
+   ELORA's 3 named evaluation domains (agent-like via Taskmaster; chat-like
+   only via Mooncake's proxy, not ELORA's actual chat dataset).

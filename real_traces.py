@@ -3,7 +3,7 @@ requests) shape core.py's synthetic generators produce -- so every phase can
 run, unmodified, on real arrival timing and real prefix-sharing structure
 instead of our invented formulas.
 
-Two traces, each fixing one specific gap named in the project's honesty list:
+Three traces, each fixing one specific gap named in the project's honesty list:
 
   BurstGPT (github.com/HPMLL/BurstGPT, CC-BY-4.0)
     10M+ real ChatGPT/GPT-4 request logs from Azure OpenAI, arrival timestamp
@@ -15,15 +15,17 @@ Two traces, each fixing one specific gap named in the project's honesty list:
     sharing: each request lists `hash_ids`, the 512-token prefix blocks its
     prompt matches. Matching hash_ids across requests = shareable KV cache.
     Replaces make_prefix_sharing_workload's invented "3 fixed-size groups"
-    with REAL, Zipf-shaped, multi-turn sharing structure.
+    with REAL, Zipf-shaped, multi-turn sharing structure. No LoRA-adapter
+    field -- adapter identity is inferred from the depth-2 hash node (see
+    load_mooncake_conversations for the exact mapping and its limitation).
 
-Neither trace carries a LoRA-adapter field (both are single-model traces).
-We map adapter identity from Mooncake's own structure: the depth-2 hash node
-(the first prefix block after the universal root) is treated as "which
-system prompt / adapter this request's session belongs to" -- a real,
-Zipf-shaped popularity distribution, not an assumption. Requests whose depth-2
-node has fewer than MIN_ADAPTER_GROUP members are pooled into an "overflow"
-adapter so we don't create thousands of one-shot pseudo-adapters.
+  Google Taskmaster TM-1 (github.com/google-research-datasets/Taskmaster)
+    ONE OF ELORA'S OWN THREE EVALUATION DATASETS ("Personal Agents"). Real
+    task-oriented dialogs with a genuine task-type field (`instruction_id`),
+    used directly as adapter identity -- no inference needed, unlike
+    Mooncake. See load_taskmaster_conversations for detail, including how we
+    handle its missing timestamps the same way ELORA's own paper says they
+    did (overlay Azure-trace-style arrival timing -- here, BurstGPT).
 
 HONEST LIMITATION: Mooncake's real prefix chains are variable-depth and grow
 turn-by-turn (turn 1 shares 4 blocks, turn 2 shares 5, ...). Our simulator's
@@ -185,6 +187,97 @@ def load_mooncake_conversations(name="conversation_trace", seed=0,
 
 
 # ==========================================================================
+# Taskmaster -- real task-type adapter identity (ELORA's own third dataset)
+# ==========================================================================
+
+# rough words -> tokens ratio for a quick, defensible proxy; real tokenizers
+# vary, but this is in the right ballpark for English chat text.
+WORDS_TO_TOKENS = 1.3
+
+
+def load_taskmaster_conversations(path=None):
+    """Convert Google Taskmaster (TM-1, self-dialogs) into core.py's
+    (conversations, requests) shape.
+
+    This is one of ELORA's OWN three evaluation datasets ("Personal Agents").
+    Unlike Mooncake, Taskmaster ships a genuine task-type field --
+    `instruction_id` (e.g. "restaurant-table-2", "pizza-ordering-1") -- which
+    is a much more natural adapter-identity proxy than anything we inferred
+    from Mooncake's hash structure: it is literally "which specialized task
+    this conversation needs," directly analogous to "which specialized LoRA
+    this customer's request needs." 15 distinct task types across 7,708 real
+    dialogs, with a real, substantial popularity skew (top type used by 1,211
+    conversations, versus Mooncake's most-popular-adapter count of just 7) --
+    a genuinely different, more ELORA-shaped regime than the Mooncake trace.
+
+    Taskmaster has NO arrival timestamps. Neither did ELORA's own copy of it:
+    their paper states plainly they "adopt query arrival patterns from the
+    Microsoft Azure function trace" for exactly this dataset. We do the same
+    thing they did -- overlay real BurstGPT arrival timing (see
+    build_real_workload in run_on_real_traces.py) -- rather than inventing a
+    new arrival model, so this reconstruction follows ELORA's OWN documented
+    method for handling this dataset's missing field, not a method we made up.
+
+    Adds to each Conversation:
+      .prefix_group / .prefix_tokens / .prefix_key : NOT populated (no
+        cross-conversation prefix-sharing signal exists in Taskmaster the way
+        it does in Mooncake's hash_ids). Set to 0/None. Phase 6/7 prefix-tree
+        behavior on this trace reduces to "no sharing" -- an honest gap, not
+        a fabricated one.
+    Adds to each Request:
+      .is_first_turn : bool
+    """
+    path = path or os.path.join(TRACES_DIR, "taskmaster_tm1.json")
+    dialogs = json.load(open(path))
+
+    conversations = []
+    requests = []
+    rid = 0
+    adapter_remap = {}
+    next_id = 0
+    for cid, dlg in enumerate(dialogs):
+        task = dlg["instruction_id"]
+        if task not in adapter_remap:
+            adapter_remap[task] = next_id
+            next_id += 1
+        adapter = adapter_remap[task]
+        convo = Conversation(adapter, cid)
+        convo.prefix_group = 0
+        convo.prefix_tokens = 0
+        convo.prefix_key = None
+
+        turn_idx = 0
+        pending_output = None
+        for u in dlg["utterances"]:
+            if u["speaker"] == "USER":
+                # a USER utterance opens a turn; its output is whatever the
+                # ASSISTANT says next (or a small default if the dialog ends
+                # on a user turn).
+                pending_output = None
+            elif u["speaker"] == "ASSISTANT" and pending_output is None:
+                out_tokens = max(1, round(len(u["text"].split()) * WORDS_TO_TOKENS))
+                # placeholder arrival_time=turn_idx; real timing is overlaid
+                # by build_real_workload() using BurstGPT gaps, matching
+                # ELORA's own documented method for this dataset.
+                r = Request(rid, cid, out_tokens, float(turn_idx))
+                r.is_first_turn = (turn_idx == 0)
+                requests.append(r)
+                rid += 1
+                turn_idx += 1
+                pending_output = True
+        if turn_idx == 0:
+            # a dialog with no assistant replies at all (rare edge case):
+            # give it one placeholder turn so it isn't silently dropped
+            r = Request(rid, cid, 10, 0.0)
+            r.is_first_turn = True
+            requests.append(r)
+            rid += 1
+        conversations.append(convo)
+
+    return conversations, requests
+
+
+# ==========================================================================
 # Summary / sanity check when run standalone
 # ==========================================================================
 
@@ -211,6 +304,20 @@ def main():
     prefixed = [c for c in convos if c.prefix_tokens > 0]
     print(f"  conversations with a shared prefix: {len(prefixed)}/{len(convos)}, "
           f"mean shared tokens {sum(c.prefix_tokens for c in prefixed)/max(1,len(prefixed)):.0f}")
+
+    print("\n=== Taskmaster TM-1 (self-dialogs) ===")
+    tconvos, treqs = load_taskmaster_conversations()
+    print(f"  {len(tconvos)} conversations, {len(treqs)} requests")
+    tn_adapters = len(set(c.adapter_id for c in tconvos))
+    from collections import Counter
+    tpop = Counter(c.adapter_id for c in tconvos)
+    print(f"  {tn_adapters} distinct adapters (real task types)")
+    print(f"  top 5 adapter popularity: {tpop.most_common(5)}")
+    tturns = [0] * len(tconvos)
+    for r in treqs:
+        tturns[r.conversation_id] += 1
+    print(f"  turns per conversation: min {min(tturns)} max {max(tturns)} "
+          f"mean {sum(tturns)/len(tturns):.1f}")
 
 
 if __name__ == "__main__":
