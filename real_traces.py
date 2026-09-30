@@ -24,7 +24,9 @@ Four traces, each fixing one specific gap named in the project's honesty list:
     sharing: each request lists `hash_ids`, the 512-token prefix blocks its
     prompt matches. Matching hash_ids across requests = shareable KV cache.
     Replaces make_prefix_sharing_workload's invented "3 fixed-size groups"
-    with REAL, Zipf-shaped, multi-turn sharing structure. No LoRA-adapter
+    with a DERIVED prefix length -- see the WARNING in
+    load_mooncake_conversations: it collapses to a constant in practice,
+    and staleness results are highly sensitive to it. No LoRA-adapter
     field -- adapter identity is inferred from the depth-2 hash node (see
     load_mooncake_conversations for the exact mapping and its limitation).
 
@@ -36,13 +38,30 @@ Four traces, each fixing one specific gap named in the project's honesty list:
     handle its missing timestamps the same way ELORA's own paper says they
     did (overlay Azure-trace-style arrival timing -- here, BurstGPT).
 
-HONEST LIMITATION: Mooncake's real prefix chains are variable-depth and grow
-turn-by-turn (turn 1 shares 4 blocks, turn 2 shares 5, ...). Our simulator's
-prefix-tree model (phase 6/7) uses ONE prefix_tokens length per conversation.
-We collapse the real chain to a single number: 512 * (blocks shared with at
-least one other conversation), taken from the conversation's LAST turn (its
-deepest, most-shared prefix). This under-counts a conversation's sharing in
-its early turns and is a real simplification -- flagged in README/ROADMAP.
+CRITICAL LIMITATION -- READ BEFORE TRUSTING ANY STALENESS NUMBER:
+
+Mooncake's real prefix chains ARE variable-depth and DO grow turn-by-turn,
+but our derivation of a single prefix_tokens per conversation does NOT
+preserve that. Measured on the actual shipped data (960-conversation slice,
+min_adapter_reuse=2): prefix_tokens is a CONSTANT 1024 for every single
+conversation -- min == median == max. The filter
+`depth2_count[h] >= 2 or h == root` matches only 1-2 blocks per chain in
+practice (the universal root hash that literally every request shares,
+plus at most one genuinely-shared depth-2 block), and after the reuse
+filter every survivor lands on exactly 2 blocks.
+
+Worse, the simulator's staleness output is HIGHLY SENSITIVE to this
+derived constant. Same slice, same pool, same policy, only prefix_tokens
+changed:
+    prefix_tokens=1024 -> 42.5% stale      (the value we ship)
+    prefix_tokens= 512 -> 53.7% stale
+    prefix_tokens=   0 ->  0.0% stale
+
+So Mooncake staleness figures are a function of OUR DERIVATION, not a
+measurement of Mooncake's real sharing structure. The fact that 1024
+happens to yield ~42.4% -- numerically close to ELORA's reported 42.4% --
+is a COINCIDENCE of the constant we chose, and must not be presented as
+independent corroboration. See REAL_DATA_FINDINGS.md.
 
 Run standalone to print summary stats:  python real_traces.py
 """
@@ -142,7 +161,15 @@ def load_mooncake_conversations(name="conversation_trace", seed=0,
     private one-off adapter is the honest mapping. (An earlier version pooled
     all such conversations into one shared "overflow" bucket, which fabricated
     a single fake mega-adapter used by ~60% of conversations -- a bug, not a
-    finding. Fixed here.)"""
+    finding. Fixed here.)
+
+    WARNING -- prefix_tokens derived below is effectively a CONSTANT (1024)
+    for every conversation after filtering, NOT the variable per-conversation
+    sharing depth the module docstring's earlier drafts claimed. Staleness
+    results are highly sensitive to this constant (1024->42.5%, 512->53.7%,
+    0->0.0%). Any staleness number from this loader reflects our derivation,
+    not a measurement of Mooncake's real prefix structure. See the module
+    docstring's CRITICAL LIMITATION section."""
     records = _load_mooncake_raw(name)
     threads = _group_into_conversations(records)
 

@@ -64,20 +64,30 @@ speed dial, not just the two aggressive/conservative points), plus
 **two of which are ELORA's own named evaluation datasets** (Taskmaster =
 their "Personal Agents" set; LMSYS-33k = their "Chatbot" set, real timestamps
 and real model identity, no inference or overlay needed) — all free, public,
-no GPU needed. Findings: **the pathology reproduces on Mooncake** (42.4%
-stale at a realistic slab — squarely inside ELORA's reported 42.4%/48.6%
-band, corroborating their core premise on real data), and **the swapper's
-proactive-eviction weakness reproduces on all three** real datasets.
+no GPU needed.
 
-**On ELORA's own two datasets we could not measure the pathology at all** —
-neither carries a cross-conversation prefix-sharing field, which makes our
-staleness metric structurally unable to fire (proven by a controlled
-0.00% → 99.40% test when a prefix is injected). An earlier version of this
-README misread that 0% as a finding about traffic shape; it was an artifact
-of a missing data field. **No public dataset we found carries both real
-prefix-sharing structure and real adapter identity** — that, not a
-traffic-shape difference, is the real blocker on closing the gap to ELORA's
-numbers. See `REAL_DATA_FINDINGS.md` for the corrected analysis.
+**Honest status after a self-audit: this pass produced NO valid real-data
+measurement of the stale-KV pathology.** Two claims in earlier drafts were
+overstated and have been corrected:
+- Taskmaster and LMSYS carry no prefix-sharing field, so our staleness metric
+  is structurally unable to fire (controlled test: `prefix_tokens` 0 → 400
+  moves stale KV 0.00% → 99.40%). Their "0% stale" said nothing about traffic.
+- Mooncake *has* prefix data, but our derivation collapses it to a **constant
+  1024**, and staleness tracks that constant (1024 → 42.5%, 512 → 53.7%,
+  0 → 0%). The apparent agreement with ELORA's reported 42.4% was a
+  coincidence of the constant we chose, **not corroboration.**
+
+**What does survive:** the swapper's proactive-eviction penalty (6–24% p50 on
+two of three real datasets; measured in adapter loads and latency, so
+unaffected), the real adapter-population differences, and the `max_loras`
+sizing fix. All synthetic-workload results (phases 2–7, `--sweep-scale`,
+`--swap-out-when` attribution) are unaffected throughout.
+
+**The named blocker:** no public dataset carries both real prefix-sharing
+structure *and* real adapter identity, and our tree model can't represent
+Mooncake's variable-depth chains even where the data exists. Fixing that is a
+change to the simulator's data model, not another dataset. See
+`REAL_DATA_FINDINGS.md`.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See

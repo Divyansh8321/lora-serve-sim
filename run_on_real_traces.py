@@ -4,8 +4,12 @@ in each phase's docstring.
 
 Fixes two of the "gaps" named in README's Scope & honesty section:
   - phase 6's shared prefix was invented (3 fixed-size groups, one length).
-    Here it comes from Mooncake's real hash_ids: real, Zipf-shaped, variable
-    per conversation, growing turn-by-turn.
+    Here it is DERIVED from Mooncake's real hash_ids -- but see the WARNING
+    in real_traces.load_mooncake_conversations: after filtering, the derived
+    prefix_tokens collapses to a CONSTANT 1024 for every conversation, and
+    the simulator's staleness numbers are highly sensitive to that constant.
+    Treat Mooncake staleness figures as a function of our derivation, not a
+    measurement of Mooncake's real sharing structure.
   - phase 7's burstiness was invented (a hand-tuned spike formula). Here
     request arrival timing comes directly from BurstGPT's real gaps.
 

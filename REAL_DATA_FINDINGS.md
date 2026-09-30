@@ -7,24 +7,47 @@ different traffic will never line up digit-for-digit. The goal was to
 document is that explanation, built on **three independent real datasets**,
 **two of which are literally ELORA's own named evaluation datasets**.
 
-> **Correction (post-audit).** An earlier version of this document claimed
-> that the stale-KV pathology "does not appear on either of ELORA's own
-> datasets at any pressure," and treated that as a substantive finding about
-> traffic shape. **That claim was wrong and has been removed.** A controlled
-> test (same dataset, same pool, same policy, only the prefix field changed)
-> showed the 0% was an artifact of those datasets carrying no
-> prefix-sharing signal, not a property of their traffic:
+> ## ⚠️ Corrections (post-audit) — read this first
 >
-> | Taskmaster, 200 convos, 300 MB pool, `lru-leaf` | stale KV |
+> A self-audit found **two** overstated claims, both now corrected. Together
+> they mean **this document contains no valid measurement of the stale-KV
+> pathology on real data.**
+>
+> **Correction 1 — "the pathology doesn't appear on ELORA's own datasets" was
+> an artifact.** Taskmaster and LMSYS carry no prefix-sharing field, so
+> `prefix_tokens=0`. Our staleness metric counts resident prefix-tree nodes
+> whose adapter was evicted; with no prefix nodes, the only nodes are
+> per-conversation leaves, which exist only while their conversation is
+> active — exactly when its adapter is pinned. 0% was near-structurally
+> guaranteed. Controlled test (Taskmaster, 200 convos, 300 MB, `lru-leaf`):
+>
+> | prefix_tokens | stale KV |
 > |---|---|
-> | `prefix_tokens=0` (as the dataset ships) | **0.00%** |
-> | `prefix_tokens=400` (synthetic prefix injected) | **99.40%** |
+> | 0 (as shipped) | **0.00%** |
+> | 400 (injected) | **99.40%** |
 >
-> Our staleness metric counts resident prefix-tree nodes whose adapter has
-> been evicted. With no prefix nodes, the only nodes are per-conversation
-> leaves, which exist only while their conversation is active — exactly when
-> their adapter is pinned. So 0% was close to structurally guaranteed.
-> See "What we could and could not measure" below for the corrected reading.
+> **Correction 2 — the Mooncake "42.4% matches ELORA's 42.4%" was a
+> coincidence of a constant we chose.** Our derivation of `prefix_tokens`
+> from Mooncake's `hash_ids` collapses to a **constant 1024** for every
+> conversation (min == median == max), not the "variable, Zipf-shaped,
+> growing turn-by-turn" structure earlier drafts described. And staleness is
+> highly sensitive to that constant (Mooncake, 960 convos, 11.6 GB, 60 slots):
+>
+> | prefix_tokens | stale KV |
+> |---|---|
+> | 1024 (the value we ship) | **42.5%** |
+> | 512 | **53.7%** |
+> | 0 | **0.0%** |
+>
+> So the numerical agreement with ELORA's reported 42.4% reflects our chosen
+> constant, **not independent corroboration.** It should never have been
+> presented as a match.
+>
+> **What still stands:** Finding 4 (the swapper's proactive-eviction churn) —
+> measured in adapter loads and latency, not staleness — though it holds on
+> only **two of three** datasets, not all three as originally written. The
+> synthetic-workload results (phases 2–7, `--sweep-scale`, `--swap-out-when`
+> attribution) are unaffected throughout.
 
 ## The three datasets
 
@@ -70,7 +93,7 @@ window at a matched conversation count.
 |---|---|---|---|---|
 | distinct adapters | 7,373 | 15 | 20 (9-20 per window) | 12 |
 | top adapter's use count | 7 | 1,211 | 1,384 (in a 6k-convo window) | Zipf-skewed |
-| adapters used by only 1 convo | 96% | 0% | 0% | 0% |
+| adapters used by only 1 convo | 94% | 0% | 0% | 0% |
 
 Mooncake is far *more* long-tailed than we assumed. Taskmaster and LMSYS —
 **both of them ELORA's own datasets** — are much closer to our synthetic
@@ -83,28 +106,45 @@ actual regime than it was to "real traffic" in general.**
 `--min-adapter-reuse 2` (Mooncake only) restricts to conversations whose
 adapter is used ≥2 times — traffic where a caching decision exists at all.
 
-## Finding 2: the stale-KV pathology reproduces severely on Mooncake, lands in ELORA's own reported range
+## Finding 2 (CORRECTED): Mooncake's staleness numbers are a function of our own derived constant, not a measurement
 
-433 real Mooncake adapters, slab sized ~40% of that (matching how ELORA
-itself sizes `--max-loras` — a plausible fraction of a *known* real LoRA
-count, never a huge oversubscription ratio):
+433 real Mooncake adapters, slab sized ~40% of that:
 
 | max_loras (pool) | `lru-leaf` p50 | stale KV |
 |---|---|---|
-| 12 (2,400 MB) — old synthetic-tuned default, unthinkingly reused | 12,570,552 ms | 56.4% |
-| 60 (11,600 MB) — 40% of the 433 real adapters | 9,922,084 ms | 42.4% |
+| 12 (2,400 MB) — old synthetic-tuned default | 12,570,552 ms | 56.4% |
+| 60 (11,600 MB) — 40% of the 433 real adapters | 9,922,084 ms | 42.5% |
 | 200 (36,400 MB) | 8,338 ms | 40.2% |
 
-The old `max_loras=12` was a leftover from our synthetic 12-adapter workload,
-applied unthinkingly to 433 real competing adapters (36:1 oversubscription).
-Fixed: `--max-loras` now auto-scales to 40% of the real in-play adapter
-count. The collapse persists through 60 slots and only clears near 200 — so
-it is **not primarily a sizing artifact**, though the old default was still
-wrong and is now fixed.
+**The `max_loras` fix is real and stands.** The old 12 was a leftover from our
+synthetic 12-adapter workload applied to 433 real competing adapters (36:1
+oversubscription); `--max-loras` now auto-scales to 40% of the real in-play
+count. The latency collapse persists through 60 slots and only clears near
+200, so it isn't primarily a sizing artifact.
 
-At the corrected 60-slot slab: `ordering` 17.2% stale, `dep-aware` 15.4%
-stale — both thousands of times better than `lru-leaf`, both landing near
-ELORA's own reported range (42.4% vLLM, 48.6% ELORA-WOM).
+**The staleness numbers in that table do NOT stand as measurements.** Our
+`prefix_tokens` derivation from Mooncake's `hash_ids` yields a constant 1024
+for every conversation, and staleness tracks that constant directly:
+
+| prefix_tokens (960 convos, 11.6 GB, 60 slots) | stale KV | adapter loads |
+|---|---|---|
+| 1024 (shipped) | 42.5% | 140 |
+| 512 | 53.7% | 305 |
+| 0 | 0.01% | 554 |
+
+Earlier drafts framed "42.4% on Mooncake ≈ ELORA's reported 42.4%" as
+independent corroboration of their premise. **It is not.** It is the output
+of a constant we chose, which happens to land near their number. Choosing 512
+instead would have produced 53.7% and an equally confident-sounding but
+different story.
+
+**What this leaves:** we have no valid real-data measurement of the stale-KV
+pathology. Mooncake is the only dataset with prefix data at all, and our
+reduction of it to one constant destroys the variation that would make the
+measurement meaningful. Doing this properly requires modelling Mooncake's
+actual variable-depth, per-turn-growing hash chains rather than collapsing
+them — which the current phase 6/7 tree model (one `prefix_tokens` per
+conversation) cannot represent without modification.
 
 ## Finding 3 (CORRECTED): what we could and could not measure on ELORA's own datasets
 
@@ -149,63 +189,70 @@ prefix-sharing structure *and* real adapter identity. Mooncake has the first;
 Taskmaster and LMSYS have the second; **no dataset we found has both.** That
 is the real blocker, and it is a data-availability limitation, not a finding.
 
-## Finding 4: the swapper's core weakness reproduces on all three real datasets
+## Finding 4 (the one real-data result that stands): the swapper's proactive eviction hurts on TWO of three real datasets
 
 | dataset | `react-lru` p50 | `swap-full` p50 | delta | adapter loads (react-lru → swap-full) |
 |---|---|---|---|---|
-| Mooncake (realistic slab) | 5,914 | 5,877 | +0.6% | 708 → 590 |
-| Taskmaster (loose pool) | 224 | 277 | −24.6% | 165 → 292 |
-| LMSYS (auto-scaled) | 1,643 | 1,743 | −6.1% | 688 → 1,684 |
+| Mooncake (realistic slab) | 5,911 | 5,854 | **+1.0%** | 703 → **588** (churn *down*) |
+| Taskmaster (loose pool) | 225 | 277 | **−23.5%** | 165 → 292 (churn up) |
+| LMSYS (auto-scaled) | 1,611 | 1,718 | **−6.6%** | 56 → 1,116 (churn way up) |
 
-On real arrival timing, from three unrelated real sources, the swapper's
-*proactive* eviction consistently creates unnecessary adapter churn when
-nothing forced it — the same `--swap-out-when highwater` vs `full` mechanism
-phase 7's synthetic sweep identified. This is not an artifact of our
-synthetic bursty formula.
+This is the **only real-data finding unaffected by the prefix-derivation
+problem**, because it is measured in adapter loads and latency, not staleness.
+
+Earlier drafts said "reproduces on all three." **That was wrong** — it
+reproduces on two. On Mooncake the swapper actually *reduces* churn (703 →
+588) and is marginally faster. The honest statement: on two of three real
+datasets the swapper's proactive eviction creates unnecessary churn and costs
+6–24% p50; on the third it helps slightly. Directionally consistent with the
+synthetic `--swap-out-when` finding in the majority of cases, but **not
+unanimous**, and the disagreeing case is the one dataset with the most
+adapters in play.
 
 ## The overarching answer: why don't our numbers match ELORA's?
 
-The honest, evidence-backed answer, after correcting Finding 3:
+The honest answer, after both corrections: **we did not explain it, and this
+pass produced no valid real-data measurement of the pathology at all.**
 
-**Where we could measure the pathology, it reproduced and landed in ELORA's
-reported range. Where we could not measure it, we could not measure it — and
-that covers both of their own accessible datasets.** Specifically:
+- **Mooncake** — the only dataset with any prefix data. But our reduction of
+  its variable-depth hash chains to one number yields a constant, and
+  staleness tracks that constant (1024→42.5%, 512→53.7%, 0→0%). The apparent
+  agreement with ELORA's 42.4% is an artifact of the constant we picked.
+  **Not a measurement.**
+- **Taskmaster / LMSYS** — real adapter identity, no prefix field, so the
+  staleness metric cannot fire. **Not a measurement.**
+- **OPUS-100 / their Azure trace slice** — not public. **Untested.**
 
-- **Mooncake** (real prefix-sharing data, adapter identity inferred):
-  pathology reproduces severely, 42.4% stale at a realistic slab, squarely
-  inside ELORA's reported 42.4%/48.6% band. **This is a genuine
-  corroboration of their motivation.**
-- **Taskmaster and LMSYS** (real adapter identity, but *no* prefix-sharing
-  field): the metric is structurally unable to register staleness. We
-  learned nothing here about whether the pathology occurs — only that we
-  can't test it with this data.
-- **OPUS-100 / their Azure trace slice** (their third dataset): not public,
-  not reconstructable. Untested entirely.
+What this pass *did* legitimately establish:
 
-So the remaining gap between our numbers and theirs is **not explained** by
-this pass, and it would be dishonest to claim otherwise. What this pass
-actually established:
+1. **Finding 4** — the swapper's proactive eviction costs 6–24% p50 on two of
+   three real datasets (helps ~1% on the third). Measured in adapter loads and
+   latency, so unaffected by the prefix problem. **The only surviving
+   real-data result.**
+2. **Finding 1** — real adapter populations vary enormously (Mooncake 7,373
+   adapters, 94% used once; Taskmaster 15; LMSYS 20). Structural fact, no
+   derivation involved.
+3. **The `max_loras` sizing bug** — a genuine methodology fix.
+4. **A concrete, named blocker:** no public dataset carries both real
+   prefix-sharing structure *and* real adapter identity, and our tree model
+   (one `prefix_tokens` per conversation) cannot represent Mooncake's real
+   variable-depth chains even where the data exists.
 
-1. The pathology is real and reproducible on real production data where the
-   necessary signal exists (Mooncake) — ELORA's core premise holds up.
-2. The **swapper's proactive-eviction weakness** (Finding 4) reproduces
-   across all three real datasets, because that finding is measured in
-   adapter loads and latency, not staleness — so it survives the Finding 3
-   correction intact. This is our most robust independent result.
-3. **No public dataset we could find carries both real prefix-sharing
-   structure and real adapter identity.** Mooncake has the first, Taskmaster
-   and LMSYS have the second. Closing the remaining gap properly needs a
-   trace with both, or ELORA's own instrumented setup.
+**What would actually be needed** to answer the original question: extend the
+phase 6/7 prefix tree to model per-turn-growing, variable-depth chains
+directly from Mooncake's `hash_ids` instead of collapsing them to a scalar.
+That's a real change to the simulator's data model, not another dataset or
+another sweep. Until then, any staleness claim from this project rests on
+synthetic prefix structure (phases 2–7, where the generator produces genuinely
+varied values) — which is defensible as a *model* but is not real-data
+validation.
 
-**The defensible engineering takeaway**, narrower than the earlier claim but
-actually supported: the pathology depends on a specific structural
-precondition — many adapters competing *and* meaningful KV persisting across
-adapter evictions. Mooncake-shaped traffic (long-tailed adapter population)
-demonstrably has it. Whether a given production system does is something you
-should **measure before buying into this class of optimization**, and the
-measurement requires instrumenting prefix-reuse and adapter-residency
-together — which is precisely the instrumentation none of the public traces
-provide.
+**The honest headline for this project:** it reproduces the *mechanisms*
+(admission stall, proactive-eviction churn, the capacity-fungibility argument
+for pool unification) on a from-scratch simulator, and it identifies exactly
+which of ELORA's claims can and cannot be checked against public data and why.
+It does **not** independently validate ELORA's reported magnitudes on real
+traffic, and earlier drafts of this document wrongly implied it did.
 
 ## How to reproduce
 
