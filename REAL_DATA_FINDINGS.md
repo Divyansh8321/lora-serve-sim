@@ -7,6 +7,25 @@ different traffic will never line up digit-for-digit. The goal was to
 document is that explanation, built on **three independent real datasets**,
 **two of which are literally ELORA's own named evaluation datasets**.
 
+> **Correction (post-audit).** An earlier version of this document claimed
+> that the stale-KV pathology "does not appear on either of ELORA's own
+> datasets at any pressure," and treated that as a substantive finding about
+> traffic shape. **That claim was wrong and has been removed.** A controlled
+> test (same dataset, same pool, same policy, only the prefix field changed)
+> showed the 0% was an artifact of those datasets carrying no
+> prefix-sharing signal, not a property of their traffic:
+>
+> | Taskmaster, 200 convos, 300 MB pool, `lru-leaf` | stale KV |
+> |---|---|
+> | `prefix_tokens=0` (as the dataset ships) | **0.00%** |
+> | `prefix_tokens=400` (synthetic prefix injected) | **99.40%** |
+>
+> Our staleness metric counts resident prefix-tree nodes whose adapter has
+> been evicted. With no prefix nodes, the only nodes are per-conversation
+> leaves, which exist only while their conversation is active — exactly when
+> their adapter is pinned. So 0% was close to structurally guaranteed.
+> See "What we could and could not measure" below for the corrected reading.
+
 ## The three datasets
 
 **[Mooncake FAST'25 trace](https://github.com/kvcache-ai/Mooncake)**
@@ -87,7 +106,7 @@ At the corrected 60-slot slab: `ordering` 17.2% stale, `dep-aware` 15.4%
 stale — both thousands of times better than `lru-leaf`, both landing near
 ELORA's own reported range (42.4% vLLM, 48.6% ELORA-WOM).
 
-## Finding 3: on BOTH of ELORA's own datasets, the pathology does not appear at all, at any pressure
+## Finding 3 (CORRECTED): what we could and could not measure on ELORA's own datasets
 
 Taskmaster (15 real adapters) and LMSYS (9-20 real adapters), each swept from
 a loose pool down to the tightest possible squeeze (Taskmaster: 1,900→200 MB,
@@ -95,20 +114,40 @@ a loose pool down to the tightest possible squeeze (Taskmaster: 1,900→200 MB,
 
 | dataset | tightest config | `lru-leaf` p50 | stale KV | adapter loads |
 |---|---|---|---|---|
-| Taskmaster | 1 slot, 200 MB | 476 | **0.0%** | 861 |
-| LMSYS | 1 slot, 400 MB | 3,096 | **0.1%** (negligible) | 4,436 |
+| Taskmaster | 1 slot, 200 MB | 476 | 0.0% | 861 (up from 165) |
+| LMSYS | 1 slot, 400 MB | 3,096 | 0.1% | 4,436 (up from 56) |
 
-On **both** of ELORA's own datasets, every policy tested (`lru-leaf`,
-`ordering`, `dep-aware`, `react-lru`, `swap-full`) is essentially **tied** —
-adapter *loads* climb sharply under pressure (confirming thrashing is real
-and increasing) but it almost never translates into stale KV, even at the
-single-slot extreme.
+**Do not read the 0% as "the pathology doesn't happen on this traffic."** An
+earlier version of this document made exactly that error. Neither dataset
+carries a cross-conversation prefix-sharing field (Mooncake's `hash_ids` has
+no equivalent in either), so `prefix_tokens=0` throughout — and our staleness
+metric counts resident *prefix-tree nodes* whose adapter has been evicted.
+With no prefix nodes, the only nodes are per-conversation leaves, which exist
+only while their conversation is active, i.e. exactly when their adapter is
+pinned. **0% was close to structurally guaranteed by the missing field.**
 
-**This is the central finding of this project's final pass.** ELORA's own
-two named datasets, tested at every pressure level from loose to maximally
-tight, **do not reproduce the pathology their own paper's motivation section
-describes.** Only Mooncake — a dataset from an unrelated production system,
-not one of theirs — reproduces it severely.
+Controlled proof (same dataset, same pool, same policy; only the prefix field
+changed):
+
+| Taskmaster, 200 convos, 300 MB pool, `lru-leaf` | stale KV |
+|---|---|
+| `prefix_tokens=0` (as shipped) | **0.00%** |
+| `prefix_tokens=400` (synthetic prefix injected) | **99.40%** |
+
+**What we CAN legitimately conclude from these two datasets:**
+- Adapter-level thrashing is real and scales sharply with pressure
+  (Taskmaster 165→861 loads; LMSYS 56→4,436 loads). That is measured, not
+  inferred.
+- Policy choice made no measurable difference *to latency* on either — but
+  since the staleness signal these policies are designed to exploit was
+  absent by construction, this is **not** evidence that the policies are
+  useless. It is evidence that we could not test them on this data.
+
+**What we CANNOT conclude:** anything about whether ELORA's pathology occurs
+in agent-style or chat-arena traffic. Answering that needs a trace with real
+prefix-sharing structure *and* real adapter identity. Mooncake has the first;
+Taskmaster and LMSYS have the second; **no dataset we found has both.** That
+is the real blocker, and it is a data-availability limitation, not a finding.
 
 ## Finding 4: the swapper's core weakness reproduces on all three real datasets
 
@@ -126,38 +165,47 @@ synthetic bursty formula.
 
 ## The overarching answer: why don't our numbers match ELORA's?
 
-Putting findings 2, 3, and 4 together, the honest, evidence-backed answer is:
+The honest, evidence-backed answer, after correcting Finding 3:
 
-**ELORA's own two named non-chat datasets (agent, chat-arena) don't produce
-the pathology their motivation section describes, at any memory pressure we
-could construct from them. Only a dataset from an unrelated system —
-Mooncake — reproduces it, and it reproduces it *severely*, landing right in
-their reported range.** Two explanations are consistent with this, and we
-cannot fully distinguish them without ELORA's exact code or hardware:
+**Where we could measure the pathology, it reproduced and landed in ELORA's
+reported range. Where we could not measure it, we could not measure it — and
+that covers both of their own accessible datasets.** Specifically:
 
-1. **ELORA's aggregate number is dominated by their third dataset**, the
-   translation workload (OPUS-100 + a real Azure Function trace slice), which
-   we could not access or reconstruct — Microsoft's internal trace slice they
-   used isn't published, and OPUS-100 has no natural per-adapter identity the
-   way Taskmaster and LMSYS do. If the pathology is concentrated there, our
-   two matching-domain tests would correctly show it absent while the
-   paper's *averaged* headline number is still accurate for their full mix.
-2. **Real deployed adapter/LoRA counts and popularity structure in ELORA's
-   production-scale runs (20/50/100 LoRAs at data-center scale) differ from
-   what a 33K/8K-conversation public research dataset can recreate.** Their
-   headline evaluations run at scale we cannot reconstruct from a released
-   research sample — we don't have their live production LoRA population,
-   only fixed public snapshots.
+- **Mooncake** (real prefix-sharing data, adapter identity inferred):
+  pathology reproduces severely, 42.4% stale at a realistic slab, squarely
+  inside ELORA's reported 42.4%/48.6% band. **This is a genuine
+  corroboration of their motivation.**
+- **Taskmaster and LMSYS** (real adapter identity, but *no* prefix-sharing
+  field): the metric is structurally unable to register staleness. We
+  learned nothing here about whether the pathology occurs — only that we
+  can't test it with this data.
+- **OPUS-100 / their Azure trace slice** (their third dataset): not public,
+  not reconstructable. Untested entirely.
 
-Both point to the same practical conclusion: **the stale-KV pathology, and
-the entire case for a smart eviction policy, is a property of the specific
-traffic mix, not a universal property of multi-tenant LoRA serving.** A
-system with Taskmaster/LMSYS-shaped traffic (a moderate set of well-known,
-reusable configurations) may not need this machinery at all. A system with
-Mooncake-shaped traffic (many, mostly one-off, long-tailed configurations)
-needs it badly. **Knowing which regime you're in is the actual engineering
-decision** — more useful, and more honest, than a claim that any one fixed
-policy is universally better.
+So the remaining gap between our numbers and theirs is **not explained** by
+this pass, and it would be dishonest to claim otherwise. What this pass
+actually established:
+
+1. The pathology is real and reproducible on real production data where the
+   necessary signal exists (Mooncake) — ELORA's core premise holds up.
+2. The **swapper's proactive-eviction weakness** (Finding 4) reproduces
+   across all three real datasets, because that finding is measured in
+   adapter loads and latency, not staleness — so it survives the Finding 3
+   correction intact. This is our most robust independent result.
+3. **No public dataset we could find carries both real prefix-sharing
+   structure and real adapter identity.** Mooncake has the first, Taskmaster
+   and LMSYS have the second. Closing the remaining gap properly needs a
+   trace with both, or ELORA's own instrumented setup.
+
+**The defensible engineering takeaway**, narrower than the earlier claim but
+actually supported: the pathology depends on a specific structural
+precondition — many adapters competing *and* meaningful KV persisting across
+adapter evictions. Mooncake-shaped traffic (long-tailed adapter population)
+demonstrably has it. Whether a given production system does is something you
+should **measure before buying into this class of optimization**, and the
+measurement requires instrumenting prefix-reuse and adapter-residency
+together — which is precisely the instrumentation none of the public traces
+provide.
 
 ## How to reproduce
 
@@ -190,24 +238,37 @@ python run_on_real_traces.py --workload lmsys --n-conversations 6000
    is not published). If their pathology concentrates there, we cannot see
    it — this is the single biggest open gap in this reconstruction.
 2. **Mooncake and BurstGPT-overlaid timing mix two unrelated real systems.**
-   LMSYS is the only fully-self-contained real dataset here (real timing,
-   real identity, one source) — treat it as the highest-confidence result of
-   the three.
+   LMSYS is the only fully-self-contained real dataset (real timing, real
+   identity, one source) — but it is also missing the prefix-sharing field,
+   so "self-contained" does not make it the most *informative* here. Mooncake
+   is the only dataset on which the pathology could actually be measured.
 3. **Mooncake's adapter identity is inferred; Taskmaster's and LMSYS's are
    genuine fields.** Different confidence levels across datasets.
 4. **No cross-conversation prefix-sharing signal exists in Taskmaster or
    LMSYS** the way it does in Mooncake's hash_ids — `prefix_tokens=0`
-   throughout for both, an honest gap.
-5. **`lru-leaf`'s multi-hour/multi-thousand-ms latencies are genuine
+   throughout for both. **This is not a minor caveat: it makes the staleness
+   metric structurally unable to fire on those two datasets** (proven by the
+   0.00% → 99.40% controlled test in Finding 3). Any "0% stale" result on
+   Taskmaster or LMSYS says nothing about their traffic.
+5. **Intra-conversation turn gaps are ~1 ms on both Taskmaster and LMSYS**,
+   versus the 6,000 ms think-time our synthetic workload uses. For LMSYS this
+   is a data limitation (the arena logs one timestamp per battle, not per
+   message). **For Taskmaster it was our bug** — placeholder
+   `arrival_time=turn_idx` values (0,1,2,…) that the BurstGPT overlay then
+   faithfully preserved. Re-tested with realistic 6 s gaps injected: the
+   headline numbers held, but adapter loads jumped 861 → 6,096, so the gap
+   structure does materially affect the workload and this should be fixed
+   properly before any further Taskmaster conclusions are drawn.
+6. **`lru-leaf`'s multi-hour/multi-thousand-ms latencies are genuine
    simulator output** (verified: TTFT stays normal, only queueing wait
    balloons) but not literal production forecasts — a real system sheds load
    long before this.
-6. **LMSYS's 20 models don't all appear in every time window** — arena
+7. **LMSYS's 20 models don't all appear in every time window** — arena
    traffic rotates its model roster over time rather than mixing all 20
    uniformly, so a single contiguous slice sees a real subset (9-20 of 20
    depending on window size/position). This is itself a real trace
    characteristic, not a sampling bug.
-7. **Scale.** Our biggest real-data runs use thousands of conversations;
+8. **Scale.** Our biggest real-data runs use thousands of conversations;
    ELORA's production evaluations run at a scale (20-100 LoRAs across
    multi-GPU deployments processing continuous real traffic) that a released
    research-sample trace cannot fully recreate.

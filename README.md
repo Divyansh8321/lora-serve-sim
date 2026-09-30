@@ -64,12 +64,20 @@ speed dial, not just the two aggressive/conservative points), plus
 **two of which are ELORA's own named evaluation datasets** (Taskmaster =
 their "Personal Agents" set; LMSYS-33k = their "Chatbot" set, real timestamps
 and real model identity, no inference or overlay needed) — all free, public,
-no GPU needed. Headline finding: **the stale-KV pathology is
-traffic-shape-dependent, and on BOTH of ELORA's own datasets it never
-appears at any pressure tested** — only on Mooncake (an unrelated third-party
-trace) does it reproduce, severely, landing in their reported range. See
-`REAL_DATA_FINDINGS.md` for the full evidence and what this implies about
-why our numbers diverge from theirs.
+no GPU needed. Findings: **the pathology reproduces on Mooncake** (42.4%
+stale at a realistic slab — squarely inside ELORA's reported 42.4%/48.6%
+band, corroborating their core premise on real data), and **the swapper's
+proactive-eviction weakness reproduces on all three** real datasets.
+
+**On ELORA's own two datasets we could not measure the pathology at all** —
+neither carries a cross-conversation prefix-sharing field, which makes our
+staleness metric structurally unable to fire (proven by a controlled
+0.00% → 99.40% test when a prefix is injected). An earlier version of this
+README misread that 0% as a finding about traffic shape; it was an artifact
+of a missing data field. **No public dataset we found carries both real
+prefix-sharing structure and real adapter identity** — that, not a
+traffic-shape difference, is the real blocker on closing the gap to ELORA's
+numbers. See `REAL_DATA_FINDINGS.md` for the corrected analysis.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
@@ -395,11 +403,24 @@ reader can calibrate:
    output (verified, not a bug) but not a literal production forecast — a
    real system would shed load long before that point.
 9. **We could not obtain or reconstruct ELORA's third dataset** (OPUS-100
-   translation + their specific, unpublished Azure Function trace slice).
-   This is the single biggest open gap: if ELORA's reported pathology
-   concentrates in that third domain, our two matching-domain real-data tests
-   (which found it doesn't appear) and their averaged headline number are not
-   actually in conflict — see `REAL_DATA_FINDINGS.md`'s closing section.
+   translation + their specific, unpublished Azure Function trace slice) —
+   untested entirely.
+10. **No public dataset we found carries BOTH real prefix-sharing structure
+    AND real adapter identity.** Mooncake has the first (so the pathology is
+    measurable there, and reproduces); Taskmaster and LMSYS have the second
+    (so the staleness metric cannot fire, proven by a controlled
+    0.00% → 99.40% prefix-injection test). **This is the actual blocker on
+    closing the gap to ELORA's numbers** — not hardware, not traffic shape.
+    An earlier version of this README and `REAL_DATA_FINDINGS.md` misread the
+    resulting 0% as a substantive traffic-shape finding; that has been
+    corrected.
+11. **Intra-conversation turn gaps are ~1 ms on Taskmaster and LMSYS** vs the
+    6,000 ms our synthetic workload uses. A data limitation for LMSYS (one
+    timestamp per arena battle); **our own bug for Taskmaster** (placeholder
+    per-turn values the BurstGPT overlay then preserved). Re-testing with
+    realistic 6 s gaps held the headline numbers but moved adapter loads
+    861 → 6,096 — it materially affects the workload and should be fixed
+    before drawing further Taskmaster conclusions.
 
 ## Limitations
 
