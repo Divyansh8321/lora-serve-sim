@@ -58,16 +58,18 @@ any single hardware constant alone), `--sweep-scale` (a continuous compute-
 speed dial, not just the two aggressive/conservative points), plus
 `sweeps/*.py` as standalone artifacts.
 
-**Real production traces.** `real_traces.py` + `run_on_real_traces.py` replay
-phases 6 and 7 against real data on **two independent real workloads**
-(`--workload mooncake|taskmaster`) instead of our synthetic formulas — real
-prefix-sharing structure (Mooncake FAST'25 trace), a real task-type adapter
-population (Google Taskmaster — **one of ELORA's own three evaluation
-datasets**), and real bursty arrival timing (BurstGPT, CC-BY-4.0) — all free,
-public, no GPU needed. Key finding: **the stale-KV pathology is
-traffic-shape-dependent** — it reproduces severely on Mooncake's long-tailed
-adapter population, but never appears at all on Taskmaster's moderate,
-skewed one, at any pool/slab size tried. See `REAL_DATA_FINDINGS.md`.
+**Real production traces — the project's closing validation.**
+`real_traces.py` + `run_on_real_traces.py` replay phases 6 and 7 against
+**three independent real datasets** (`--workload mooncake|taskmaster|lmsys`),
+**two of which are ELORA's own named evaluation datasets** (Taskmaster =
+their "Personal Agents" set; LMSYS-33k = their "Chatbot" set, real timestamps
+and real model identity, no inference or overlay needed) — all free, public,
+no GPU needed. Headline finding: **the stale-KV pathology is
+traffic-shape-dependent, and on BOTH of ELORA's own datasets it never
+appears at any pressure tested** — only on Mooncake (an unrelated third-party
+trace) does it reproduce, severely, landing in their reported range. See
+`REAL_DATA_FINDINGS.md` for the full evidence and what this implies about
+why our numbers diverge from theirs.
 
 `validation/` drives a real `vllm serve` with the *identical* workload
 (`make_multi_turn_workload`) to check the curve on hardware. See
@@ -383,14 +385,21 @@ reader can calibrate:
    batch-at-a-time step model — so phase 7's "swapper flips positive at
    ELORA's engine" is the *direction* ELORA reports, at a plausible constant
    band, not a reproduction of their 1.42×.
-8. **Real-trace results (see `REAL_DATA_FINDINGS.md`) mix two different real
-   systems.** BurstGPT's arrivals (real Azure OpenAI traffic) are overlaid
-   onto Mooncake's conversations (a real, different Kimi/Moonshot deployment)
-   — the best available combination of two real signals, not one ground-truth
-   trace. Adapter identity is inferred from Mooncake's shared-prompt structure
-   (defensible, not measured). `lru-leaf`'s multi-hour real-trace latency is a
-   genuine simulator output (verified, not a bug) but not a literal production
-   forecast — a real system would shed load long before that point.
+8. **Real-trace results (see `REAL_DATA_FINDINGS.md`) mix real systems for
+   two of three datasets.** BurstGPT's arrivals are overlaid onto Mooncake's
+   and Taskmaster's conversations (each a different real system) — the best
+   available combination, not one ground-truth trace. LMSYS is the exception:
+   real timing and real identity both come from the same source, no overlay.
+   Adapter identity is inferred for Mooncake, genuine for Taskmaster and
+   LMSYS. `lru-leaf`'s multi-hour real-trace latency is a genuine simulator
+   output (verified, not a bug) but not a literal production forecast — a
+   real system would shed load long before that point.
+9. **We could not obtain or reconstruct ELORA's third dataset** (OPUS-100
+   translation + their specific, unpublished Azure Function trace slice).
+   This is the single biggest open gap: if ELORA's reported pathology
+   concentrates in that third domain, our two matching-domain real-data tests
+   (which found it doesn't appear) and their averaged headline number are not
+   actually in conflict — see `REAL_DATA_FINDINGS.md`'s closing section.
 
 ## Limitations
 

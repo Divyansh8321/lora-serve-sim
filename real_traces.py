@@ -3,7 +3,16 @@ requests) shape core.py's synthetic generators produce -- so every phase can
 run, unmodified, on real arrival timing and real prefix-sharing structure
 instead of our invented formulas.
 
-Three traces, each fixing one specific gap named in the project's honesty list:
+Four traces, each fixing one specific gap named in the project's honesty list:
+
+  LMSYS Chatbot Arena (huggingface.co/datasets/lmsys/chatbot_arena_conversations)
+    ELORA'S OWN "CHATBOT" EVALUATION DATASET, named directly in their paper
+    as "LMSYS-33k". 33,000 real arena battles, REAL timestamps, 20 real
+    named models ("20 SOTA models such as GPT-4, Claude, and LLaMA-based
+    Vicuna" -- ELORA's own words) used directly as adapter identity. No
+    inference, no missing-field workaround -- the closest thing we have to
+    literally ELORA's setup. Gated on HuggingFace (free login + accept
+    terms); see REAL_DATA_FINDINGS.md for how to obtain it.
 
   BurstGPT (github.com/HPMLL/BurstGPT, CC-BY-4.0)
     10M+ real ChatGPT/GPT-4 request logs from Azure OpenAI, arrival timestamp
@@ -44,6 +53,11 @@ import os
 from collections import defaultdict
 
 from core import Conversation, Request
+
+try:
+    import pyarrow.parquet as _pq
+except ImportError:
+    _pq = None
 
 TRACES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
 MIN_ADAPTER_GROUP = 2      # depth-2 nodes with fewer requesters -> overflow adapter
@@ -278,6 +292,103 @@ def load_taskmaster_conversations(path=None):
 
 
 # ==========================================================================
+# LMSYS Chatbot Arena -- ELORA's own "Chatbot" dataset, real timestamps
+# ==========================================================================
+
+def load_lmsys_conversations(path=None, limit=None):
+    """Convert LMSYS Chatbot Arena conversations
+    (huggingface.co/datasets/lmsys/chatbot_arena_conversations) into
+    core.py's (conversations, requests) shape.
+
+    THIS IS ELORA'S OWN "CHATBOT" EVALUATION DATASET -- the paper names
+    "LMSYS-33k" directly. Of the three real datasets in this project, this
+    is the closest we get to literally what ELORA evaluated on.
+
+    Format: each row is one ARENA BATTLE -- two models (model_a, model_b)
+    each answer the SAME prompt sequence, judged head-to-head. We treat each
+    side of the battle as an independent real conversation, using the real
+    model name as adapter identity: "20 SOTA models such as GPT-4, Claude,
+    and LLaMA-based Vicuna" (ELORA's own description) is a real, named,
+    ground-truth adapter identity -- no inference needed, unlike Mooncake,
+    and no missing-field workaround needed, unlike Taskmaster.
+
+    Unlike Taskmaster, this dataset carries REAL TIMESTAMPS (`tstamp`, a
+    Unix time per battle) -- no BurstGPT overlay needed. Real arrival timing
+    AND real adapter identity, both directly from the source, on the one
+    dataset that's actually ELORA's.
+
+    Requires `pyarrow` (pip install pyarrow) to read the .parquet file, and
+    the file itself, which is gated -- see README/REAL_DATA_FINDINGS.md for
+    how to obtain it (free HuggingFace login + accepting the dataset's terms).
+
+    Adds to each Conversation:
+      .prefix_group / .prefix_tokens / .prefix_key : NOT populated. Arena
+        battles share a prompt PREFIX ACROSS conversations that use
+        DIFFERENT adapters (model_a and model_b see the same first message)
+        -- the opposite of our prefix-tree model's assumption (same adapter,
+        shared prefix). Left at 0/None; an honest gap, not fabricated.
+    Adds to each Request:
+      .is_first_turn : bool
+    """
+    if _pq is None:
+        raise ImportError("load_lmsys_conversations needs pyarrow: pip install pyarrow")
+    path = path or os.path.join(TRACES_DIR, "lmsys_arena.parquet")
+    cols = ["model_a", "model_b", "conversation_a", "conversation_b", "tstamp"]
+    table = _pq.read_table(path, columns=cols)
+    rows = table.to_pylist()
+    if limit:
+        rows = rows[:limit]
+
+    adapter_remap = {}
+    next_adapter_id = 0
+
+    def adapter_for(model_name):
+        nonlocal next_adapter_id
+        if model_name not in adapter_remap:
+            adapter_remap[model_name] = next_adapter_id
+            next_adapter_id += 1
+        return adapter_remap[model_name]
+
+    conversations = []
+    requests = []
+    rid = 0
+    cid = 0
+    for row in rows:
+        t0_ms = row["tstamp"] * 1000.0
+        for side, model_key, convo_key in [("a", "model_a", "conversation_a"),
+                                           ("b", "model_b", "conversation_b")]:
+            adapter = adapter_for(row[model_key])
+            convo = Conversation(adapter, cid)
+            convo.prefix_group = 0
+            convo.prefix_tokens = 0
+            convo.prefix_key = None
+
+            turn_idx = 0
+            for msg in row[convo_key]:
+                if msg.get("role") != "assistant":
+                    continue
+                out_tokens = max(1, round(len(msg["content"].split()) * WORDS_TO_TOKENS))
+                # all turns of one battle land at (approximately) the same
+                # real arrival time -- the arena logs one tstamp per battle,
+                # not per message. Nudge subsequent turns forward by 1ms each
+                # so ordering within a conversation stays well-defined.
+                r = Request(rid, cid, out_tokens, t0_ms + turn_idx)
+                r.is_first_turn = (turn_idx == 0)
+                requests.append(r)
+                rid += 1
+                turn_idx += 1
+            if turn_idx == 0:
+                r = Request(rid, cid, 10, t0_ms)
+                r.is_first_turn = True
+                requests.append(r)
+                rid += 1
+            conversations.append(convo)
+            cid += 1
+
+    return conversations, requests
+
+
+# ==========================================================================
 # Summary / sanity check when run standalone
 # ==========================================================================
 
@@ -318,6 +429,26 @@ def main():
         tturns[r.conversation_id] += 1
     print(f"  turns per conversation: min {min(tturns)} max {max(tturns)} "
           f"mean {sum(tturns)/len(tturns):.1f}")
+
+    if _pq is not None and os.path.exists(os.path.join(TRACES_DIR, "lmsys_arena.parquet")):
+        print("\n=== LMSYS Chatbot Arena (ELORA's own 'Chatbot' dataset) ===")
+        lconvos, lreqs = load_lmsys_conversations()
+        print(f"  {len(lconvos)} conversations, {len(lreqs)} requests")
+        ln_adapters = len(set(c.adapter_id for c in lconvos))
+        from collections import Counter
+        lpop = Counter(c.adapter_id for c in lconvos)
+        print(f"  {ln_adapters} distinct adapters (real model names)")
+        print(f"  top 5 adapter popularity: {lpop.most_common(5)}")
+        lturns = [0] * len(lconvos)
+        for r in lreqs:
+            lturns[r.conversation_id] += 1
+        print(f"  turns per conversation: min {min(lturns)} max {max(lturns)} "
+              f"mean {sum(lturns)/len(lturns):.1f}")
+        ts = sorted(r.arrival_time for r in lreqs)
+        print(f"  real arrival span: {(ts[-1]-ts[0])/1000/3600/24:.1f} days")
+    else:
+        print("\n=== LMSYS Chatbot Arena: skipped (no traces/lmsys_arena.parquet, "
+              "or pyarrow not installed) ===")
 
 
 if __name__ == "__main__":

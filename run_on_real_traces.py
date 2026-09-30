@@ -35,7 +35,7 @@ from collections import Counter
 
 from core import get_profile, percentile
 from real_traces import (load_burstgpt_arrivals, load_mooncake_conversations,
-                         load_taskmaster_conversations)
+                         load_taskmaster_conversations, load_lmsys_conversations)
 from phase6_radix_prefix import RadixSim, POLICIES as P6_POLICIES
 from phase7_cost_swapper import Phase7Sim, POLICIES as P7_POLICIES
 
@@ -130,9 +130,46 @@ def build_taskmaster_workload(seed, n_conversations=2000):
     return _overlay_burstgpt_timing(convos, reqs, seed)
 
 
+def build_lmsys_workload(seed, n_conversations=2000):
+    """LMSYS Chatbot Arena conversations/requests: real model-name adapter
+    identity AND real arrival timestamps (ELORA's own 'Chatbot' dataset --
+    no overlay, no inference, both real fields used directly).
+
+    `seed` slides the conversation window forward through the trace's own
+    real chronological order (not a BurstGPT overlay -- this dataset has
+    real timing of its own) so different windows sample different real
+    62.8-day history, same spirit as the other two loaders' `seed`.
+    """
+    convos, reqs = load_lmsys_conversations()
+    # sort by each conversation's own first-turn real arrival time
+    first_by_cid = {}
+    for r in reqs:
+        if r.conversation_id not in first_by_cid or r.arrival_time < first_by_cid[r.conversation_id]:
+            first_by_cid[r.conversation_id] = r.arrival_time
+    ordered_cids = sorted(first_by_cid, key=lambda c: first_by_cid[c])
+
+    start = (seed * n_conversations) % max(1, len(ordered_cids))
+    window_cids = set(ordered_cids[start:start + n_conversations])
+    if len(window_cids) < n_conversations:
+        window_cids |= set(ordered_cids[:n_conversations - len(window_cids)])
+
+    convos = [c for c in convos if c.conversation_id in window_cids]
+    reqs = [r for r in reqs if r.conversation_id in window_cids]
+
+    # rebase to start at t=0 like the other loaders, so downstream sim code
+    # (and any hardcoded starvation/step-loop assumptions) sees a workload
+    # starting near time zero rather than 2023's raw Unix timestamp.
+    t0 = min(r.arrival_time for r in reqs)
+    for r in reqs:
+        r.arrival_time -= t0
+    reqs.sort(key=lambda r: r.arrival_time)
+    return convos, reqs
+
+
 WORKLOADS = {
     "mooncake": build_real_workload,
     "taskmaster": build_taskmaster_workload,
+    "lmsys": build_lmsys_workload,
 }
 
 
@@ -140,6 +177,8 @@ def _build(workload, seed, n_conversations, min_adapter_reuse):
     if workload == "mooncake":
         return build_real_workload(seed, n_conversations=n_conversations,
                                    min_adapter_reuse=min_adapter_reuse)
+    if workload == "lmsys":
+        return build_lmsys_workload(seed, n_conversations=n_conversations)
     return build_taskmaster_workload(seed, n_conversations=n_conversations)
 
 
@@ -186,12 +225,16 @@ def avg(trial_fn, **kw):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--workload", choices=["mooncake", "taskmaster"], default="mooncake",
+    ap.add_argument("--workload", choices=["mooncake", "taskmaster", "lmsys"],
+                    default="mooncake",
                     help="mooncake: real prefix-sharing, adapter identity INFERRED, "
                          "long-tailed (hundreds of mostly-one-off adapters). "
                          "taskmaster: ELORA's own 'Personal Agents' dataset, real "
                          "task-type field used directly as adapter identity, "
-                         "moderate real popularity skew (15 types).")
+                         "moderate real popularity skew (15 types). "
+                         "lmsys: ELORA's own 'Chatbot' dataset (LMSYS-33k), real "
+                         "model-name adapter identity AND real timestamps, both "
+                         "used directly -- 20 adapters, real popularity skew.")
     ap.add_argument("--pool-mb", type=float, default=None,
                     help="unified pool MB. Default: auto-scaled from the real "
                          "adapter count actually in play (see --min-adapter-reuse).")
@@ -256,7 +299,8 @@ def main():
         print(f"{pol:>12} {m['p50']:>8.0f} {m['p95']:>9.0f} {m['ttft_p50']:>9.0f}"
               f" {m['stale']:>8.1f}%{tag}")
 
-    print("\n== PHASE 7 policies on REAL arrival timing (BurstGPT) ==")
+    timing_src = "LMSYS's own real timestamps" if args.workload == "lmsys" else "BurstGPT"
+    print(f"\n== PHASE 7 policies on REAL arrival timing ({timing_src}) ==")
     print(f"{'policy':>16} {'p50':>8} {'p95':>9} {'TTFT p50':>9} {'TPOT':>7}"
           f" {'stale KV':>9} {'ldrs':>6}   vs react-lru")
     print("-" * 78)
