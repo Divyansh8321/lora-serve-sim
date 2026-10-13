@@ -1,0 +1,149 @@
+0.31.0
+name, memory.total [MiB]
+NVIDIA A100-SXM4-80GB, 81920 MiB
+=================  ml6_off0  (KV blocks 2460)  =================
+waiting for server...
+(APIServer pid=4151) INFO 10-13 09:19:31 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 2460, 'enable_prefix_caching': True, 'enable_lora': True, 'max_loras': 6, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=4619) INFO 10-13 09:20:16 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=25578 with num_gpu_blocks_override=2460
+(EngineCore pid=4619) INFO 10-13 09:20:16 [kv_cache_utils.py:2464] GPU KV cache size: 39,360 tokens, Maximum concurrency for 8,192 tokens per request: 4.80x
+[p7] seed=0 burst=1.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b1_s0.jsonl
+[p7] mean TTFT 3714 ms  TPOT 22.0 ms  e2e 8073 ms  late 2716 ms
+[p7] seed=1 burst=1.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b1_s1.jsonl
+[p7] mean TTFT 1644 ms  TPOT 20.8 ms  e2e 5671 ms  late 1279 ms
+[p7] seed=2 burst=1.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b1_s2.jsonl
+[p7] mean TTFT 874 ms  TPOT 21.3 ms  e2e 5087 ms  late 1022 ms
+[p7] seed=0 burst=5.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b5_s0.jsonl
+[p7] mean TTFT 4918 ms  TPOT 24.4 ms  e2e 9884 ms  late 5737 ms
+[p7] seed=1 burst=5.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b5_s1.jsonl
+[p7] mean TTFT 3055 ms  TPOT 23.1 ms  e2e 7500 ms  late 3072 ms
+[p7] seed=2 burst=5.0 tag=ml6_off0: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off0_b5_s2.jsonl
+[p7] mean TTFT 5231 ms  TPOT 23.9 ms  e2e 10137 ms  late 5269 ms
+=================  ml10_off0  (KV blocks 2100)  =================
+waiting for server...
+(APIServer pid=5180) INFO 10-13 09:43:34 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 2100, 'enable_prefix_caching': True, 'enable_lora': True, 'max_loras': 10, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=5624) INFO 10-13 09:44:49 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=24764 with num_gpu_blocks_override=2100
+(EngineCore pid=5624) INFO 10-13 09:44:49 [kv_cache_utils.py:2464] GPU KV cache size: 33,600 tokens, Maximum concurrency for 8,192 tokens per request: 4.10x
+[p7] seed=0 burst=1.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b1_s0.jsonl
+[p7] mean TTFT 678 ms  TPOT 26.1 ms  e2e 5817 ms  late 1267 ms
+[p7] seed=1 burst=1.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b1_s1.jsonl
+[p7] mean TTFT 183 ms  TPOT 22.5 ms  e2e 4541 ms  late 739 ms
+[p7] seed=2 burst=1.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b1_s2.jsonl
+[p7] mean TTFT 224 ms  TPOT 22.0 ms  e2e 4586 ms  late 786 ms
+[p7] seed=0 burst=5.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b5_s0.jsonl
+[p7] mean TTFT 4228 ms  TPOT 33.4 ms  e2e 11023 ms  late 4664 ms
+[p7] seed=1 burst=5.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b5_s1.jsonl
+[p7] mean TTFT 979 ms  TPOT 29.3 ms  e2e 6633 ms  late 1958 ms
+[p7] seed=2 burst=5.0 tag=ml10_off0: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off0_b5_s2.jsonl
+[p7] mean TTFT 2311 ms  TPOT 32.3 ms  e2e 8916 ms  late 3433 ms
+=================  ml14_off0  (KV blocks 1740)  =================
+waiting for server...
+(APIServer pid=6194) INFO 10-13 10:08:08 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 1740, 'enable_prefix_caching': True, 'enable_lora': True, 'max_loras': 14, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=6640) INFO 10-13 10:09:20 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=24274 with num_gpu_blocks_override=1740
+(EngineCore pid=6640) INFO 10-13 10:09:20 [kv_cache_utils.py:2464] GPU KV cache size: 27,840 tokens, Maximum concurrency for 8,192 tokens per request: 3.40x
+[p7] seed=0 burst=1.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b1_s0.jsonl
+[p7] mean TTFT 702 ms  TPOT 28.0 ms  e2e 6201 ms  late 1457 ms
+[p7] seed=1 burst=1.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b1_s1.jsonl
+[p7] mean TTFT 180 ms  TPOT 23.1 ms  e2e 4658 ms  late 779 ms
+[p7] seed=2 burst=1.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b1_s2.jsonl
+[p7] mean TTFT 184 ms  TPOT 22.8 ms  e2e 4702 ms  late 803 ms
+[p7] seed=0 burst=5.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b5_s0.jsonl
+[p7] mean TTFT 6885 ms  TPOT 32.6 ms  e2e 13531 ms  late 7014 ms
+[p7] seed=1 burst=5.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b5_s1.jsonl
+[p7] mean TTFT 3458 ms  TPOT 30.6 ms  e2e 9360 ms  late 3543 ms
+[p7] seed=2 burst=5.0 tag=ml14_off0: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off0_b5_s2.jsonl
+[p7] mean TTFT 5693 ms  TPOT 32.6 ms  e2e 12375 ms  late 5998 ms
+=================  ml6_off19  (KV blocks 2460)  =================
+waiting for server...
++ vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-lora --max-loras 6 --max-cpu-loras 20 --max-lora-rank 32 --gpu-memory-utilization 0.85 --max-model-len 8192 --enable-prefix-caching --port 8000 --num-gpu-blocks-override 2460 --kv-offloading-backend native --kv-offloading-size 19 --lora-modules lora0=/root/adapters/lora0 lora1=/root/adapters/lora1 lora2=/root/adapters/lora2 lora3=/root/adapters/lora3 lora4=/root/adapters/lora4 lora5=/root/adapters/lora5 lora6=/root/adapters/lora6 lora7=/root/adapters/lora7 lora8=/root/adapters/lora8 lora9=/root/adapters/lora9 lora10=/root/adapters/lora10 lora11=/root/adapters/lora11 lora12=/root/adapters/lora12 lora13=/root/adapters/lora13 lora14=/root/adapters/lora14 lora15=/root/adapters/lora15 lora16=/root/adapters/lora16 lora17=/root/adapters/lora17 lora18=/root/adapters/lora18 lora19=/root/adapters/lora19
+(APIServer pid=7210) INFO 10-13 10:32:36 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 2460, 'enable_prefix_caching': True, 'kv_offloading_size': 19.0, 'enable_lora': True, 'max_loras': 6, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=7653) INFO 10-13 10:33:09 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=25578 with num_gpu_blocks_override=2460
+(EngineCore pid=7653) INFO 10-13 10:33:09 [kv_cache_utils.py:2464] GPU KV cache size: 39,360 tokens, Maximum concurrency for 8,192 tokens per request: 4.80x
+(EngineCore pid=7653) INFO 10-13 10:33:09 [factory.py:62] Creating v1 connector with name: OffloadingConnector and engine_id: 56c9c897-4e6f-4e6d-adc9-5a4671f7861a
+[p7] seed=0 burst=1.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b1_s0.jsonl
+[p7] mean TTFT 3134 ms  TPOT 20.8 ms  e2e 7251 ms  late 2169 ms
+[p7] seed=1 burst=1.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b1_s1.jsonl
+[p7] mean TTFT 1456 ms  TPOT 20.0 ms  e2e 5343 ms  late 1090 ms
+[p7] seed=2 burst=1.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b1_s2.jsonl
+[p7] mean TTFT 798 ms  TPOT 20.6 ms  e2e 4892 ms  late 975 ms
+[p7] seed=0 burst=5.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b5_s0.jsonl
+[p7] mean TTFT 4508 ms  TPOT 22.9 ms  e2e 9184 ms  late 4824 ms
+[p7] seed=1 burst=5.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b5_s1.jsonl
+[p7] mean TTFT 2672 ms  TPOT 21.7 ms  e2e 6856 ms  late 2716 ms
+[p7] seed=2 burst=5.0 tag=ml6_off19: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml6_off19_b5_s2.jsonl
+[p7] mean TTFT 4448 ms  TPOT 22.3 ms  e2e 9021 ms  late 4336 ms
+=================  ml10_off19  (KV blocks 2100)  =================
+waiting for server...
++ vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-lora --max-loras 10 --max-cpu-loras 20 --max-lora-rank 32 --gpu-memory-utilization 0.85 --max-model-len 8192 --enable-prefix-caching --port 8000 --num-gpu-blocks-override 2100 --kv-offloading-backend native --kv-offloading-size 19 --lora-modules lora0=/root/adapters/lora0 lora1=/root/adapters/lora1 lora2=/root/adapters/lora2 lora3=/root/adapters/lora3 lora4=/root/adapters/lora4 lora5=/root/adapters/lora5 lora6=/root/adapters/lora6 lora7=/root/adapters/lora7 lora8=/root/adapters/lora8 lora9=/root/adapters/lora9 lora10=/root/adapters/lora10 lora11=/root/adapters/lora11 lora12=/root/adapters/lora12 lora13=/root/adapters/lora13 lora14=/root/adapters/lora14 lora15=/root/adapters/lora15 lora16=/root/adapters/lora16 lora17=/root/adapters/lora17 lora18=/root/adapters/lora18 lora19=/root/adapters/lora19
+(APIServer pid=8127) INFO 10-13 10:56:47 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 2100, 'enable_prefix_caching': True, 'kv_offloading_size': 19.0, 'enable_lora': True, 'max_loras': 10, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=8571) INFO 10-13 10:58:00 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=24764 with num_gpu_blocks_override=2100
+(EngineCore pid=8571) INFO 10-13 10:58:00 [kv_cache_utils.py:2464] GPU KV cache size: 33,600 tokens, Maximum concurrency for 8,192 tokens per request: 4.10x
+(EngineCore pid=8571) INFO 10-13 10:58:00 [factory.py:62] Creating v1 connector with name: OffloadingConnector and engine_id: 10b9cb22-5969-4423-810f-654ec1e100c6
+[p7] seed=0 burst=1.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b1_s0.jsonl
+[p7] mean TTFT 527 ms  TPOT 24.2 ms  e2e 5276 ms  late 1019 ms
+[p7] seed=1 burst=1.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b1_s1.jsonl
+[p7] mean TTFT 173 ms  TPOT 21.3 ms  e2e 4305 ms  late 651 ms
+[p7] seed=2 burst=1.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b1_s2.jsonl
+[p7] mean TTFT 202 ms  TPOT 21.1 ms  e2e 4375 ms  late 716 ms
+[p7] seed=0 burst=5.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b5_s0.jsonl
+[p7] mean TTFT 2441 ms  TPOT 28.8 ms  e2e 8304 ms  late 3033 ms
+[p7] seed=1 burst=5.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b5_s1.jsonl
+[p7] mean TTFT 621 ms  TPOT 25.3 ms  e2e 5522 ms  late 1302 ms
+[p7] seed=2 burst=5.0 tag=ml10_off19: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml10_off19_b5_s2.jsonl
+[p7] mean TTFT 1360 ms  TPOT 28.1 ms  e2e 7099 ms  late 2205 ms
+=================  ml14_off19  (KV blocks 1740)  =================
+waiting for server...
++ vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-lora --max-loras 14 --max-cpu-loras 20 --max-lora-rank 32 --gpu-memory-utilization 0.85 --max-model-len 8192 --enable-prefix-caching --port 8000 --num-gpu-blocks-override 1740 --kv-offloading-backend native --kv-offloading-size 19 --lora-modules lora0=/root/adapters/lora0 lora1=/root/adapters/lora1 lora2=/root/adapters/lora2 lora3=/root/adapters/lora3 lora4=/root/adapters/lora4 lora5=/root/adapters/lora5 lora6=/root/adapters/lora6 lora7=/root/adapters/lora7 lora8=/root/adapters/lora8 lora9=/root/adapters/lora9 lora10=/root/adapters/lora10 lora11=/root/adapters/lora11 lora12=/root/adapters/lora12 lora13=/root/adapters/lora13 lora14=/root/adapters/lora14 lora15=/root/adapters/lora15 lora16=/root/adapters/lora16 lora17=/root/adapters/lora17 lora18=/root/adapters/lora18 lora19=/root/adapters/lora19
+(APIServer pid=9197) INFO 10-13 11:21:45 [api_utils.py:286] non-default args: {'model_tag': 'meta-llama/Llama-3.1-8B-Instruct', 'lora_modules': [LoRAModulePath(name='lora0', path='/root/adapters/lora0', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora1', path='/root/adapters/lora1', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora2', path='/root/adapters/lora2', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora3', path='/root/adapters/lora3', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora4', path='/root/adapters/lora4', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora5', path='/root/adapters/lora5', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora6', path='/root/adapters/lora6', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora7', path='/root/adapters/lora7', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora8', path='/root/adapters/lora8', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora9', path='/root/adapters/lora9', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora10', path='/root/adapters/lora10', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora11', path='/root/adapters/lora11', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora12', path='/root/adapters/lora12', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora13', path='/root/adapters/lora13', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora14', path='/root/adapters/lora14', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora15', path='/root/adapters/lora15', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora16', path='/root/adapters/lora16', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora17', path='/root/adapters/lora17', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora18', path='/root/adapters/lora18', base_model_name=None, is_3d_lora_weight=False), LoRAModulePath(name='lora19', path='/root/adapters/lora19', base_model_name=None, is_3d_lora_weight=False)], 'model': 'meta-llama/Llama-3.1-8B-Instruct', 'max_model_len': 8192, 'gpu_memory_utilization': 0.85, 'num_gpu_blocks_override': 1740, 'enable_prefix_caching': True, 'kv_offloading_size': 19.0, 'enable_lora': True, 'max_loras': 14, 'max_lora_rank': 32, 'max_cpu_loras': 20}
+(EngineCore pid=9639) INFO 10-13 11:22:59 [kv_cache_utils.py:2772] Overriding num_gpu_blocks=24274 with num_gpu_blocks_override=1740
+(EngineCore pid=9639) INFO 10-13 11:22:59 [kv_cache_utils.py:2464] GPU KV cache size: 27,840 tokens, Maximum concurrency for 8,192 tokens per request: 3.40x
+(EngineCore pid=9639) INFO 10-13 11:22:59 [factory.py:62] Creating v1 connector with name: OffloadingConnector and engine_id: 03bf4ccb-ef23-4bf8-8b60-16bf3e4d90a6
+[p7] seed=0 burst=1.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 231 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b1_s0.jsonl
+[p7] mean TTFT 378 ms  TPOT 24.5 ms  e2e 5203 ms  late 1037 ms
+[p7] seed=1 burst=1.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 277 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b1_s1.jsonl
+[p7] mean TTFT 178 ms  TPOT 21.3 ms  e2e 4307 ms  late 650 ms
+[p7] seed=2 burst=1.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 228 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b1_s2.jsonl
+[p7] mean TTFT 181 ms  TPOT 21.2 ms  e2e 4388 ms  late 712 ms
+[p7] seed=0 burst=5.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 174 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b5_s0.jsonl
+[p7] mean TTFT 4575 ms  TPOT 28.3 ms  e2e 10348 ms  late 4281 ms
+[p7] seed=1 burst=5.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 216 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b5_s1.jsonl
+[p7] mean TTFT 1686 ms  TPOT 26.3 ms  e2e 6768 ms  late 1860 ms
+[p7] seed=2 burst=5.0 tag=ml14_off19: 80 conversations, 400 turns, schedule 184 s
+[p7] 400 ok, 0 errors -> validation/results/p7_ml14_off19_b5_s2.jsonl
+[p7] mean TTFT 3373 ms  TPOT 28.8 ms  e2e 9269 ms  late 3318 ms
+
+done. now:  python3 validation/compare_p7.py

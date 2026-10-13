@@ -1,0 +1,27 @@
+
+== burst x1: mean TTFT ms (TPOT ms) ==
+            config         sim a100         sim ours         MEASURED  errors  late ms
+         vllm ml=6     1443 (16.5)     3599 (20.5)     2077 (21.4)       0     1672
+        vllm ml=10      572 (16.9)      997 (21.6)      362 (23.5)       0      931
+        vllm ml=14      597 (17.3)     1193 (22.9)      355 (24.6)       0     1013
+ vllm-offload ml=6      879 (15.0)     1609 (17.6)     1796 (20.5)       0     1411
+vllm-offload ml=10      406 (15.0)      570 (17.7)      301 (22.2)       0      796
+vllm-offload ml=14      405 (15.0)      559 (17.7)      246 (22.3)       0      800
+   sim a100: best vLLM+offload vs best vLLM TTFT -29%; best vLLM vs ml=6 -60%
+   measured: best vLLM+offload vs best vLLM TTFT -31%; best vLLM vs ml=6 -83%
+
+== burst x5: mean TTFT ms (TPOT ms) ==
+            config         sim a100         sim ours         MEASURED  errors  late ms
+         vllm ml=6     5266 (18.4)     9396 (23.2)     4401 (23.8)       0     4693
+        vllm ml=10     1427 (20.2)     4968 (28.8)     2506 (31.7)       0     3352
+        vllm ml=14     2122 (20.8)     7935 (28.9)     5345 (32.0)       0     5518
+ vllm-offload ml=6     2979 (15.5)     5329 (18.5)     3876 (22.3)       0     3959
+vllm-offload ml=10      580 (15.7)      953 (18.8)     1474 (27.4)       0     2180
+vllm-offload ml=14      541 (15.7)     1007 (18.8)     3211 (27.8)       0     3153
+   sim a100: best vLLM+offload vs best vLLM TTFT -62%; best vLLM vs ml=6 -73%
+   measured: best vLLM+offload vs best vLLM TTFT -41%; best vLLM vs ml=6 -43%
+
+Read it as: same SIGN and roughly the same SIZE of the offload gain and of the
+slot-count effect = the simulator's conclusion holds on real hardware. Absolute
+ms will differ (the a100 profile is a rough guess). Non-zero 'errors' or large
+'late ms' (client could not keep the schedule) make a cell unreliable.

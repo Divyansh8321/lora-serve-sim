@@ -51,9 +51,26 @@ timing) the designs tie or ELORA loses, mainly because these public traces have
 no real gaps between a conversation's turns. Details:
 [`REAL_DATA_FINDINGS.md`](REAL_DATA_FINDINGS.md).
 
-**Real-GPU check:** a harness that replays the same workload token-for-token
-against `vllm serve` on one A100 (vLLM vs vLLM + native CPU KV offload, three
-adapter-slot settings) is in [`validation/GPU_RUN.md`](validation/GPU_RUN.md).
+**Real-GPU check (A100 80 GB, vLLM 0.31.0, Llama-3.1-8B, 20 rank-32 LoRAs,
+36 runs × 400 requests, 0 errors, ~$5):** the same workload replayed
+token-for-token against `vllm serve`, with the KV cache capped to the
+simulator's 6 GB budget. Mean TTFT, 3 seeds:
+
+| config | steady | 5× bursts |
+|---|---:|---:|
+| vLLM + offload, 6 slots (**ELORA's baseline**) | 1,796 ms | 3,876 ms |
+| vLLM, best slot count | 355 ms | 2,506 ms |
+| vLLM + offload, best slot count | **246 ms** | **1,474 ms** |
+
+- Tuning the slot count is the big lever, as simulated: −86% steady and
+  −62% bursty against ELORA's baseline setting (simulator: −54% / −81%).
+- CPU KV offload on top of the best plain vLLM: −31% steady, −41% bursty
+  (simulator: −29% / −62%). Without the first seed, which always runs right
+  after server start, the steady gain falls to −2% but the bursty gain holds (−40%).
+- Too many slots hurts under bursts (14 slots worse than 10), also as simulated.
+
+Details, raw data and the run guide: [`validation/GPU_RUN.md`](validation/GPU_RUN.md),
+[`validation/a100_results/`](validation/a100_results/).
 
 ## Quick start
 

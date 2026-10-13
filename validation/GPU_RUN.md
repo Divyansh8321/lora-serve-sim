@@ -31,7 +31,48 @@ For 6, 10 and 14 slots that is 2,460, 2,100 and 1,740 blocks. An 80 GB card
 therefore behaves like the simulator's 6 GB budget, and the results do not
 depend on the card's size.
 
-## Predicted results
+## Measured results (run 2026-10-13)
+
+RunPod A100-SXM4-80GB, vLLM 0.31.0, 36/36 runs, 400/400 requests each, 0
+errors, about 3 h 15 min and ~$5. Raw JSONL, server logs and the full log are
+in [`a100_results/`](a100_results/); `compare.txt` is the output of
+`compare_p7.py`. Mean TTFT in ms (TPOT in brackets), 3 seeds:
+
+| config | steady: sim a100 | steady: measured | bursty: sim a100 | bursty: measured |
+|---|---:|---:|---:|---:|
+| vLLM ml=6 | 1,443 | 2,077 (21.4) | 5,266 | 4,401 (23.8) |
+| vLLM ml=10 | 572 | 362 (23.5) | 1,427 | 2,506 (31.7) |
+| vLLM ml=14 | 597 | 355 (24.6) | 2,122 | 5,345 (32.0) |
+| vLLM + offload ml=6 | 879 | 1,796 (20.5) | 2,979 | 3,876 (22.3) |
+| vLLM + offload ml=10 | 406 | 301 (22.2) | 580 | 1,474 (27.4) |
+| vLLM + offload ml=14 | 405 | 246 (22.3) | 541 | 3,211 (27.8) |
+
+| effect | sim a100 | measured |
+|---|---:|---:|
+| offload vs best plain vLLM, steady | −29% | −31% |
+| offload vs best plain vLLM, bursty | −62% | −41% |
+| best plain vLLM vs ml=6, steady | −60% | −83% |
+| best plain vLLM vs ml=6, bursty | −73% | −43% |
+| best offload vs offload ml=6 (ELORA's baseline), steady | −54% | −86% |
+| best offload vs offload ml=6, bursty | −81% | −62% |
+
+**Verdict:** the signs all match and the sizes are within about 20 points.
+The adapter-slot setting and the CPU KV tier together explain the large
+gains, and too many slots hurt under bursts (ml=14 worse than ml=10).
+
+**Caveats:**
+- Seed 0 always runs first after a server start and is 2–4× slower than
+  seeds 1 and 2 in every config. It reproduced in the smoke test (3,749 vs
+  3,714 ms), so it is either warm-up or a heavier seed; the two cannot be
+  separated here. Without seed 0, offload's steady gain is −2% (best offload
+  179 ms vs best plain 182 ms), but its bursty gain holds (990 vs 1,645 ms,
+  −40%).
+- `late` is large (0.6–5.5 s) because a turn is sent only after the previous
+  turn of that conversation finishes. That is the intended closed-loop
+  behaviour, but it means bursty cells see less load than scheduled.
+- TPOT is 20–32 ms, against 15–21 ms in the a100 profile.
+
+## Predicted results (before the run)
 
 From `python validation/compare_p7.py --predict-only`. Mean TTFT in ms, rough
 A100 timing profile, 3 seeds:
