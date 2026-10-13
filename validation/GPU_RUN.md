@@ -61,10 +61,10 @@ The A100 timings are a guess. Expect the **direction** to hold; the
 |---|---|
 | pod start, `pip install vllm` | 10 min |
 | model download (16 GB) and adapters | 10 min |
-| smoke test (`SMOKE=1`, all 6 configs, 1 seed each) | 35 min |
+| smoke test (`SMOKE=1`: ml=6, offload off and on, 1 seed) | 15 min |
 | full matrix (36 runs + 6 server restarts) | 2 h 50 min |
 | copy results off, buffer | 15 min |
-| **total** | **about 4 h** |
+| **total** | **about 3 h 40 min** |
 
 **Cost:** one A100 80 GB at about $1.2–1.9/h is **about $5–8**; stop at $12.
 The only choice is community or secure cloud; check today's prices.
@@ -93,8 +93,9 @@ Use RunPod (or similar) with:
 
 ```bash
 git clone <your repo> && cd lora-serve-sim
-pip install -U vllm
-pip install -r validation/requirements.txt safetensors huggingface_hub
+pip install uv && uv venv /root/venv && . /root/venv/bin/activate
+uv pip install vllm==0.31.0   # the version this harness was checked against
+uv pip install -r validation/requirements.txt safetensors huggingface_hub numpy
 vllm --version
 vllm serve --help | grep -E "kv-offloading|num-gpu-blocks-override"   # both must exist
 export HF_TOKEN=<token>

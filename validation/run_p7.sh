@@ -6,7 +6,7 @@
 # fixed to the simulator's KV region, run every (burst, seed), stop.
 #
 #   ./validation/run_p7.sh                 # full matrix
-#   SMOKE=1 ./validation/run_p7.sh         # one short check of every config
+#   SMOKE=1 ./validation/run_p7.sh         # ~15 min check: ml=6, offload off and on, 1 seed
 #
 # Env knobs:
 #   MLS      adapter slot counts            (default "6 10 14"; 6 = ELORA's 0.2 ratio)
@@ -34,7 +34,7 @@ RESULTS="validation/results"
 N_ADAPTERS=$(wc -w <<<"$ADAPTER_NAMES")
 mkdir -p "$RESULTS"
 
-if [[ "${SMOKE:-0}" == "1" ]]; then BURSTS="1"; SEEDS="0"; fi
+if [[ "${SMOKE:-0}" == "1" ]]; then MLS="6"; BURSTS="1"; SEEDS="0"; fi
 
 vllm --version | tee "$RESULTS/vllm_version.txt"
 nvidia-smi --query-gpu=name,memory.total --format=csv | tee "$RESULTS/gpu.txt"
@@ -50,13 +50,17 @@ for ML in $MLS; do
   trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
 
   echo "waiting for server..."
+  UP=0
   for i in $(seq 1 120); do
-    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then break; fi
+    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then UP=1; break; fi
     if ! kill -0 $SERVE_PID 2>/dev/null; then
       echo "server died; tail of $RESULTS/serve_$TAG.log:"; tail -30 "$RESULTS/serve_$TAG.log"; exit 1
     fi
     sleep 5
   done
+  if [[ $UP != 1 ]]; then
+    echo "server not healthy after 10 min; tail of $RESULTS/serve_$TAG.log:"; tail -30 "$RESULTS/serve_$TAG.log"; exit 1
+  fi
   grep -i -E "num_gpu_blocks|GPU KV cache size|offload" "$RESULTS/serve_$TAG.log" | head -5 || true
 
   for B in $BURSTS; do
