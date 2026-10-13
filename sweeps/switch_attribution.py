@@ -1,12 +1,12 @@
 """Standalone analysis: which single ENGINE switch flips phase 7's swapper?
 
-Imports phase7_cost_swapper and, from the `ours` baseline, flips ONE switch
+Imports archive/phase7_heuristic_swapper (the original phase 7) and, from the `ours` baseline, flips ONE switch
 at a time to its ELORA value, running swap-full vs react-lru at each burst
 level. Emits a markdown table.
 
 Result: `swapout` ("evict only when full") is the switch that carries the
 sign flip; `swapmode` (async) compounds it; the hardware constants
-(pcie/decode) do not. See phase7_cost_swapper.py's docstring.
+(pcie/decode) do not. See archive/phase7_heuristic_swapper.py's docstring.
 
 Run:  python sweeps/switch_attribution.py
 """
@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import ELORA_AGGRESSIVE, get_profile
-from phase7_cost_swapper import avg, _apply_switch
+from archive.phase7_heuristic_swapper import avg, _apply_switch
 
 POOL_MB = 2400.0
 PREFIX = 400

@@ -57,6 +57,10 @@ changed:
     prefix_tokens= 512 -> 53.7% stale
     prefix_tokens=   0 ->  0.0% stale
 
+UPDATE 2026-10-11: those staleness figures were ALSO inflated by a phase-6
+lru-leaf bug (shared prefixes could never be evicted). With it fixed,
+Mooncake staleness is ~0.4%. See REAL_DATA_FINDINGS.md, Correction 3.
+
 So Mooncake staleness figures are a function of OUR DERIVATION, not a
 measurement of Mooncake's real sharing structure. The fact that 1024
 happens to yield ~42.4% -- numerically close to ELORA's reported 42.4% --
@@ -215,11 +219,26 @@ def load_mooncake_conversations(name="conversation_trace", seed=0,
         convo.prefix_tokens = shared_blocks * BLOCK_TOKENS
         convo.prefix_key = (adapter, convo.prefix_group) if convo.prefix_tokens > 0 else None
 
+        # Real prompt sizes. Mooncake's input_length is the WHOLE context sent
+        # with that request (its hash_ids chain grows turn by turn), so the
+        # NEW tokens a turn adds = input_length - (previous turn's context +
+        # previous turn's output). The first turn's shared prefix is modelled
+        # by the prefix node, so it is subtracted there. BUG FIXED: earlier
+        # versions stored input_length and never used it, so every request
+        # carried only its output tokens -- ~20x too little KV (median prompt
+        # 6,909 tokens vs median output 350).
+        prev_ctx = None
         for turn_idx, i in enumerate(idxs):
             rec = records[i]
-            r = Request(rid, cid, rec["output_length"], float(rec["timestamp"]))
+            if prev_ctx is None:
+                new_in = rec["input_length"] - convo.prefix_tokens
+            else:
+                new_in = rec["input_length"] - prev_ctx
+            prev_ctx = rec["input_length"] + rec["output_length"]
+            r = Request(rid, cid, rec["output_length"], float(rec["timestamp"]),
+                        input_tokens=max(0, new_in))
             r.is_first_turn = (turn_idx == 0)
-            r.input_length = rec["input_length"]     # extra: real prompt size, unused by core Request
+            r.input_length = rec["input_length"]     # full context, for reference
             requests.append(r)
             rid += 1
         conversations.append(convo)
@@ -289,18 +308,22 @@ def load_taskmaster_conversations(path=None):
 
         turn_idx = 0
         pending_output = None
+        user_tokens = 0            # USER words since the last ASSISTANT reply
         for u in dlg["utterances"]:
             if u["speaker"] == "USER":
                 # a USER utterance opens a turn; its output is whatever the
                 # ASSISTANT says next (or a small default if the dialog ends
                 # on a user turn).
                 pending_output = None
+                user_tokens += round(len(u["text"].split()) * WORDS_TO_TOKENS)
             elif u["speaker"] == "ASSISTANT" and pending_output is None:
                 out_tokens = max(1, round(len(u["text"].split()) * WORDS_TO_TOKENS))
                 # placeholder arrival_time=turn_idx; real timing is overlaid
                 # by build_real_workload() using BurstGPT gaps, matching
                 # ELORA's own documented method for this dataset.
-                r = Request(rid, cid, out_tokens, float(turn_idx))
+                r = Request(rid, cid, out_tokens, float(turn_idx),
+                            input_tokens=user_tokens)
+                user_tokens = 0
                 r.is_first_turn = (turn_idx == 0)
                 requests.append(r)
                 rid += 1
@@ -391,15 +414,20 @@ def load_lmsys_conversations(path=None, limit=None):
             convo.prefix_key = None
 
             turn_idx = 0
+            user_tokens = 0        # user words since the last assistant reply
             for msg in row[convo_key]:
                 if msg.get("role") != "assistant":
+                    user_tokens += round(len((msg.get("content") or "").split())
+                                         * WORDS_TO_TOKENS)
                     continue
                 out_tokens = max(1, round(len(msg["content"].split()) * WORDS_TO_TOKENS))
                 # all turns of one battle land at (approximately) the same
                 # real arrival time -- the arena logs one tstamp per battle,
                 # not per message. Nudge subsequent turns forward by 1ms each
                 # so ordering within a conversation stays well-defined.
-                r = Request(rid, cid, out_tokens, t0_ms + turn_idx)
+                r = Request(rid, cid, out_tokens, t0_ms + turn_idx,
+                            input_tokens=user_tokens)
+                user_tokens = 0
                 r.is_first_turn = (turn_idx == 0)
                 requests.append(r)
                 rid += 1

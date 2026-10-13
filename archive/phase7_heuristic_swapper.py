@@ -1,4 +1,10 @@
-"""PHASE 7 -- ELORA's cost-model swapper: does the timer earn its keep?
+"""ARCHIVED (2026-10-11). The ORIGINAL phase 7: our own heuristic approximation
+of ELORA's swapper. Superseded by phase7_elora.py, which implements ELORA as
+the paper specifies (LoRA-parent tree, host-memory tier, Eq. 3-6). Kept so
+the numbers quoted in README / REAL_DATA_FINDINGS stay reproducible.
+Run from the repo root:  python archive/phase7_heuristic_swapper.py
+
+PHASE 7 (v1) -- ELORA's cost-model swapper: does the timer earn its keep?
 
 WORLD: phase 6's substrate -- unified pool, continuous batching, radix prefix
        tree -- plus ELORA's THIRD component: a swapper that runs on a 100ms
@@ -137,16 +143,43 @@ REAL-DATA CHECK: run_on_real_traces.py replays real Mooncake conversations
   sharper/more favorable-to-testing than BurstGPT's real, messier ones. See
   REAL_DATA_FINDINGS.md.
 
-Run:  python phase7_cost_swapper.py
-      python phase7_cost_swapper.py --hw elora-aggressive --burst 1 5 10
-      python phase7_cost_swapper.py --sweep --hw-list ours --burst 10
-      python phase7_cost_swapper.py --sweep-const swap-cold --sweep-range 10 300 8 --burst 10
-      python phase7_cost_swapper.py --sweep-scale --sweep-range 1.0 0.1 10 --burst 10
+AUDIT (2026-10-11):
+  * The numbers above survive the audit's bug fixes essentially unchanged
+    (within ~1 pp): decode growth now makes room instead of overrunning the
+    pool, and a latent bug (a request blocked on an in-flight async adapter
+    transfer could be marked "finished" unserved, or wait for an unrelated
+    arrival) is fixed -- it never fired on these synthetic workloads.
+  * WITH REALISTIC PROMPTS (--input-tokens 600, --pool-mb 6000) the picture
+    changes: react-lru beats EVERY swapper variant at BOTH engines.
+      --hw ours              swap-full vs react-lru: -40% / -13% / -10%
+                             (steady / burst x5 / burst x10)
+      --hw elora-aggressive  swap-full vs react-lru: -8.7% / -4.5% / -0.1%
+    The "flips positive at ELORA's engine" result holds only for the
+    zero-prompt workload. react-dep also loses (-5% to -40%).
+  * KNOWN FIDELITY GAPS vs ELORA's actual swapper (ELORA_ALIGNMENT.md):
+    evicted KV is DROPPED here (ELORA swaps it to host memory over PCIe);
+    every adapter miss is a 300ms cold load (ELORA loads from host memory);
+    our Eval is an additive heuristic, ELORA's is multiplicative
+    (LoRA_Eval x cost x visit x (1 - sigmoid(t))); ELORA swaps out only
+    LEAF nodes, with LoRAs as parents of their KV; and prefetch here reads
+    FUTURE arrivals from the workload (an oracle) and only fires before each
+    (adapter, group)'s first request, whereas ELORA prefetches host-memory
+    root nodes by Eval when HBM < 70% used.
+
+Run:  python archive/phase7_heuristic_swapper.py
+      python archive/phase7_heuristic_swapper.py --hw elora-aggressive --burst 1 5 10
+      python archive/phase7_heuristic_swapper.py --sweep --hw-list ours --burst 10
+      python archive/phase7_heuristic_swapper.py --sweep-const swap-cold --sweep-range 10 300 8 --burst 10
+      python archive/phase7_heuristic_swapper.py --sweep-scale --sweep-range 1.0 0.1 10 --burst 10
 """
 
 import argparse
 import math
+import os
+import sys
 from collections import deque
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataclasses import replace as _replace
 from core import (MB_PER_TOKEN, PREFILL_MS_PER_TOKEN, DECODE_MS_PER_TOKEN,
@@ -450,6 +483,10 @@ class Phase7Sim:
         self.ttft = {}
         self.tpot_num = 0.0
         self.tpot_den = 0
+        self.dropped = []                           # unservable requests
+        # growth with every resident node pinned cannot be satisfied without
+        # preempting a running sequence (not modelled): record how far over.
+        self.overcommit_peak_mb = 0.0
         # future demand hint for prefetch: (adapter, group) -> earliest arrival
         self._future = {}
         for r in requests:
@@ -468,6 +505,9 @@ class Phase7Sim:
 
     def free_mb(self):
         return self.pool_mb - self.used_mb()
+
+    def _note_overcommit(self):
+        self.overcommit_peak_mb = max(self.overcommit_peak_mb, -self.free_mb())
 
     def fill(self):
         return self.used_mb() / self.pool_mb
@@ -617,6 +657,17 @@ class Phase7Sim:
             self.reused_tokens += int(round(reused / MB_PER_TOKEN))
             self.recompute_tokens += to_prefill
 
+            # this turn's NEW user-prompt tokens: extend the conversation's
+            # leaf (room first, if resident) and prefill them. Not recompute.
+            new_in = getattr(r, "input_tokens", 0)
+            if new_in > 0:
+                convo.grow_cache(new_in)
+                if self.tree.is_resident(path[-1]):
+                    self.make_room(new_in * MB_PER_TOKEN)
+                self.tree.resize(path[-1], convo.kv_cache_size)
+                self._note_overcommit()
+                to_prefill += new_in
+
             seq = SeqState(r, r.conversation_id, a, to_prefill, path)
             for n in path:
                 n.refs += 1
@@ -631,17 +682,26 @@ class Phase7Sim:
         self.run_swapper()
         swap_ms = self.schedule()
         if not self.batch:
+            # Nothing runnable. Advance to the next event: the next arrival OR
+            # the earliest in-flight async adapter transfer a waiter is blocked
+            # on. BUG FIXED: earlier versions jumped straight to the next
+            # arrival (overshooting a transfer that had already landed) and,
+            # with no arrivals left, marked the oldest waiter "finished"
+            # without ever serving it. Latent on the shipped synthetic
+            # workloads (verified: identical numbers), but not in general.
+            nxt = []
             if self.incoming:
-                self.now = max(self.now, self.incoming[0].arrival_time)
+                nxt.append(self.incoming[0].arrival_time)
+            if self.waiting:
+                nxt += [t for t in self._adapter_ready.values() if t > self.now]
+            if nxt:
+                self.now = max(self.now, min(nxt))
                 return
             if self.waiting:
-                # pool cannot fit the oldest waiter: force it, advance a step
-                r = self.waiting[0]
-                self.now += FIXED_STEP_MS + self.decode_ms_per_token
-                self.batch and None
-                self.waiting.popleft()
-                r.finish(self.now - r.arrival_time)
-                self.finished.append(r)
+                # genuinely unservable (pool smaller than one adapter + its
+                # path): record it as an explicit drop, not a completion
+                r = self.waiting.popleft()
+                self.dropped.append(r)
             return
 
         n_decode = sum(1 for s in self.batch if s.phase == "decode")
@@ -675,7 +735,12 @@ class Phase7Sim:
                 self.tpot_den += 1
                 convo = self.convos[s.cid]
                 convo.grow_cache(1)
+                if self.tree.is_resident(s.leaf):
+                    # room for the new token's KV (earlier versions grew
+                    # without checking and silently overran the pool)
+                    self.make_room(MB_PER_TOKEN)
                 self.tree.resize(s.leaf, convo.kv_cache_size)
+                self._note_overcommit()
                 if self.tree.is_resident(s.leaf):
                     s.leaf.last_used = self.now
             if s.done():
@@ -712,13 +777,14 @@ SEEDS = 5
 
 
 def trial(burst_factor, policy_name, seed, pool_mb, prefix_tokens=400,
-          max_loras=5, drift_period=60000.0, hw="ours"):
+          max_loras=5, drift_period=60000.0, hw="ours", mean_input_tokens=0):
     convos, reqs = make_bursty_workload(
         n_conversations=60, n_adapters=12, turns_per_convo=5, mean_tokens=40,
         base_rate=0.0006, turn_gap=6000, shared_prefix_tokens=prefix_tokens,
         shared_prefix_groups=3, burst_factor=burst_factor,
         burst_period=40000.0, burst_duty=0.25,
-        popularity_drift_period=drift_period, seed=seed)
+        popularity_drift_period=drift_period, seed=seed,
+        mean_input_tokens=mean_input_tokens)
     sim = Phase7Sim(reqs, convos, pool_mb, POLICIES[policy_name](), max_loras,
                     hw=hw)
     sim.run()
@@ -736,6 +802,8 @@ def trial(burst_factor, policy_name, seed, pool_mb, prefix_tokens=400,
         "adapter_loads": sim.adapter_loads,
         "prefetch": sim.prefetch_loads,
         "recompute_tokens": sim.recompute_tokens,
+        "dropped": len(sim.dropped),
+        "overcommit": sim.overcommit_peak_mb,
     }
 
 
@@ -945,6 +1013,9 @@ def main():
     ap.add_argument("--pool-mb", type=float, default=2400.0)
     ap.add_argument("--max-loras", type=int, default=5)
     ap.add_argument("--drift-period", type=float, default=60000.0)
+    ap.add_argument("--input-tokens", type=float, default=0.0,
+                    help="mean NEW user-prompt tokens per turn (0 = original "
+                         "zero-prompt workload)")
     ap.add_argument("--policies", nargs="+",
                     default=["react-lru", "react-dep", "swap-full",
                              "swap-noprefetch", "swap-wo-freq", "swap-wo-swap"])
@@ -993,7 +1064,7 @@ def main():
 
     print(__doc__)
     print(f"pool {args.pool_mb:.0f}MB | max_loras {args.max_loras} | prefix "
-          f"{args.prefix_tokens} tok | drift {args.drift_period/1000:.0f}s | "
+          f"{args.prefix_tokens} tok | input/turn {args.input_tokens:.0f} | drift {args.drift_period/1000:.0f}s | "
           f"hw={hw.name} (pcie={hw.pcie_ms_per_mb:.4f} decode={hw.decode_ms_per_token:.2f} "
           f"mode={hw.swap_mode} pf={hw.prefetch_cost} out={hw.swap_out_when}) | "
           f"adapter {hw.adapter_mb:.0f}MB | mean of {SEEDS} seeds\n")
@@ -1008,7 +1079,8 @@ def main():
         for pol in args.policies:
             m = avg(burst_factor=bf, policy_name=pol, pool_mb=args.pool_mb,
                     prefix_tokens=args.prefix_tokens, max_loras=args.max_loras,
-                    drift_period=args.drift_period, hw=hw)
+                    drift_period=args.drift_period, hw=hw,
+                    mean_input_tokens=args.input_tokens)
             if pol == "react-lru":
                 base = m["p50"]
             delta = f"{100*(base-m['p50'])/base:+.1f}%" if base else ""

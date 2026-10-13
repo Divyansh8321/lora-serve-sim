@@ -34,74 +34,70 @@ NEW CONSTRAINT -- adapter pinning:
   adapter would be the (max_loras+1)-th distinct adapter is not admitted until
   one drains.
 
-FINDING (mean over 5 seeds; adapter 180MB = core.ADAPTER_MB, rank-32
-all-linear, ELORA's rank; separate KV pool 4000MB):
+WORKLOADS (--workload):
+  chat (default, realistic): 20 adapters (ELORA's smallest setup), ~200 new
+       prompt tokens and ~200 reply tokens per turn (LMSYS/ShareGPT scale),
+       5 turns, 15 s think time. Total GPU memory 6000 MB, so KV is under
+       real pressure (keeping every conversation would need ~19 GB of KV).
+  toy: the original 12 adapters, 40-token replies, no prompts, 4000 MB.
+       KV is tiny, so KV memory is never really contested.
 
-  SEPARATE pool, shrinking the adapter slab (max_loras = adapters that fit):
-    max_loras   p50    p95   TTFT p50   TPOT   stale KV   disk loads
-       12       689   1076      22       17.0     0.0%        11
-        7       747   1531      24       19.6    13.8%        28
-        5       871   1957      29       23.1    27.7%        54
-        3      1170   2676     296       26.6    50.1%        88
+FAIRNESS (both architectures, every run):
+  * same total GPU MB (separate = slab + KV region of that total);
+  * same host-RAM adapter cache holding every adapter, so after an adapter's
+    first disk load, reloads are CPU->GPU copies. (A real operator serving
+    N adapters sets vLLM --max-cpu-loras N; ELORA has 256 GB host RAM.
+    vLLM's out-of-box default is max_loras -- see --adapter-cpu.)
+  * slab% = the adapter slab as a share of GPU memory. ELORA's vLLM baseline
+    uses 0.2, i.e. max_loras ~6-7 here.
 
-  The pathology reproduces on the realistic substrate -- 50% stale KV at
-  max_loras=3, bracketing ELORA's 42.4% (vLLM) / 48.6% (ELORA-WOM). The
-  MECHANISM is now visible and it is a TIMING one: the sharp TTFT knee at
-  max_loras=3 (22ms -> 296ms) is ADMISSION STALL -- a waiting request whose
-  adapter would be the 4th distinct adapter in the batch cannot be spliced in
-  until one of the 3 pinned adapters drains. Phases 2-4, being batch-at-a-time,
-  produced the staleness NUMBER without this mechanism.
+FINDING (2026-10-11, mean of 5 seeds; mean latency / mean TTFT, ms):
 
-  SCALE-INVARIANCE: these numbers are IDENTICAL at --adapter-mb 20, 90, and
-  180 for the same max_loras. The pathology depends on the RATIO of
-  adapters-that-fit to adapters-in-use, not the absolute MB. This is a useful
-  robustness result -- and it means the earlier ADAPTER_MB=20 phase-2..4
-  numbers were not wrong in shape, only mislabelled in units.
+  chat, --hw ours, 6000 MB
+    max_loras slab%   SEPARATE (vLLM)          UNIFIED same cap     stale KV (sep)
+       20     60%     4570 / 188               4280 / 156             0%
+       10     30%     4216 / 175               4303 / 190             6%
+        6     18%     4923 / 977               5149 / 1098           29%
+        4     12%     7815 / 3950              8179 / 4223           46%
+    UNIFIED with no batch cap: 4280 / 156.
 
-  TPOT rises 17 -> 27 as the slab shrinks: recompute-prefill of rebuilt stale
-  KV competes for the per-step token budget with every decoder in the batch.
-  This is the TPOT channel that did not exist before -- and it is exactly
-  ELORA's stated reason for their 37.8% TPOT win.
+  chat, --hw elora-aggressive: every cell 1360-1480 / 39-165, separate and
+    unified within +-4% at every slab size.
+  toy, --hw ours: separate 691 -> 763 as max_loras 12 -> 3; unified 691 -> 720.
 
-  The cross-pool signal (phase 3) still fails on latency here. cost-aware
-  moves stale KV 27.7% -> 24.2% but p50 moves by <1% -- noise. Slab capacity
-  is fixed and independent; the signal changes WHICH adapter reloads, not
-  how many.
+  READING:
+  * Separate vs unified at the SAME max_loras: within ~5% everywhere, and
+    the separate pool is sometimes FASTER. A unified pool's flexibility is
+    not worth much once both sides can reload adapters from host RAM.
+  * Stale KV reaches 46-52% in the separate pool and costs nothing we can
+    measure. It sits in the KV region's otherwise-unused space and is
+    reclaimed by LRU when needed (vLLM does the same with cached blocks).
+  * The latency cliff at small max_loras hits BOTH architectures equally.
+    It is the BATCH CAP: vLLM's max_loras is also the max number of distinct
+    adapters in one batch, so with 200-token replies a request for a 5th
+    adapter waits seconds for a slot. Lift the cap (possible only when the
+    pool is unified, since there is no fixed slab) and TTFT drops
+    3950 -> 156 ms at the 12% slab. That is the only large unified-pool
+    win here, and it disappears against a tuned vLLM (max_loras 10:
+    4216 vs 4280). Caveat: running more distinct adapters per batch costs
+    extra kernel time (Punica/SGMV), which this model does not charge, so
+    the no-cap row is optimistic.
+  * On faster hardware (elora-aggressive) sequences finish ~3x sooner, the
+    batch cap barely binds, and the two architectures are indistinguishable.
 
-  UNIFIED pool, generously sized (4000MB): flat -- p50 689 -> 706, stale KV
-  0% across the whole sweep. A big idle conversation's KV is traded for an
-  adapter slot mid-stream. Phase 4's headline, under continuous batching.
+AUDIT HISTORY:
+  * 2026-10-11 (a): earlier numbers (+66% separate penalty, TTFT 296 ms) came
+    from giving the separate pool 4000 MB of KV ON TOP of its slab and no CPU
+    adapter cache (a config vLLM rejects). Decode growth now makes room, and
+    Request.input_tokens adds user prompts.
+  * 2026-10-11 (b): the unified pool had no CPU adapter cache while the
+    separate pool did, so unified reloaded evicted adapters from disk
+    (300 ms) and separate from host RAM (30 ms). Both now get the same
+    host-RAM adapter cache. The chat workload is now the default.
 
-  UNIFIED pool, squeezed (1800MB, ~0.65x working set) -- the interesting case:
-    max_loras   policy       p50   stale KV   kv recompute
-        3       blind        774     13.7%          7      (adapter-first order)
-        3       kv-first     724      0.3%         56      (KV-before-adapters)
-        3       cost-aware   779     11.5%          5      (dependency-aware)
-    kv-first wins on BOTH p50 (-6%) and staleness (~0) by trading 8x more KV
-    recompute -- which continuous batching absorbs into the step budget.
-    cost-aware (the "smart" one) does WORSE than kv-first: it preserves KV it
-    should have dropped. Naive ordering beats dependency scoring here.
-    Whether dependency scoring wins once prefixes are SHARED is phase 6.
-
-  CPU KV tier (--kv-cpu): under continuous batching with these short
-  conversations, live-KV preemption is rare (most eviction hits already-stale
-  KV, which the CPU tier does not help). So phase 2b's "CPU tier makes
-  mistakes cheaper" effect is MUTED here -- an honest divergence from phases
-  2-4, caused by the execution model, not a bug. It would reappear with
-  longer conversations / tighter KV pools.
-
-HARDWARE PROFILE (--hw {ours,elora,elora-aggressive,elora-conservative}):
-  swaps the time constants for ELORA's H800 regime (PCIe 128GB/s -> pcie_ms
-  0.008; HBM ~3.35TB/s -> decode x0.18..0.35). The pathology is HW-ROBUST:
-  at --hw elora-aggressive the separate pool still degrades 265 -> 578 with
-  50% stale KV at max_loras=3, and the unified pool still stays flat
-  (265 -> 265). Absolute latencies drop ~3x; the shape does not move. This
-  is expected -- the pathology is a fit-RATIO effect (adapters that fit /
-  adapters in use), not a bandwidth effect.
-
-Run:  python phase5_continuous_batching.py
+Run:  python phase5_continuous_batching.py                    # chat workload
       python phase5_continuous_batching.py --hw elora-aggressive
-      python phase5_continuous_batching.py --pool unified --unified-cap 1800
+      python phase5_continuous_batching.py --workload toy
 """
 
 import argparse
@@ -248,12 +244,21 @@ class UnifiedCache:
 
     unified = True
 
-    def __init__(self, capacity_mb, cpu_mb=0, adapter_size=20.0):
+    def __init__(self, capacity_mb, cpu_mb=0, adapter_size=20.0,
+                 adapter_cpu_mb=0):
         self.capacity_mb = capacity_mb
         self.cpu_mb = cpu_mb
+        # adapter-only CPU cache, the same thing vLLM's max_cpu_loras gives the
+        # separate pool -- so both architectures reload evicted adapters from
+        # host RAM, not disk. Kept apart from cpu_mb (which is shared with KV).
+        self.adapter_cpu_mb = adapter_cpu_mb
         self.adapter_size = adapter_size
         self.a_tier = {}
         self.kv = {}
+
+    def a_cpu_free(self):
+        used = sum(self.adapter_size for t in self.a_tier.values() if t == "acpu")
+        return self.adapter_cpu_mb - used
 
     def used_mb(self):
         return (sum(self.adapter_size for t in self.a_tier.values() if t == "gpu")
@@ -274,7 +279,8 @@ class UnifiedCache:
         return self.a_tier.get(a) == "gpu"
 
     def adapter_where(self, a):
-        return self.a_tier.get(a)
+        t = self.a_tier.get(a)
+        return "cpu" if t == "acpu" else t
 
     def gpu_adapters(self):
         return [a for a, t in self.a_tier.items() if t == "gpu"]
@@ -437,6 +443,14 @@ class ContinuousBatchSim:
         self.ttft = {}                             # rid -> ms to first output token
         self.tpot_num = 0.0                        # sum of per-token decode latencies
         self.tpot_den = 0
+        # if every resident KV belongs to a running sequence, growth cannot be
+        # satisfied without preempting one (not modelled); record how far over.
+        self.overcommit_peak_mb = 0.0
+        self.kv_peak_mb = 0.0
+
+    def _free_mb(self):
+        c = self.cache
+        return c.free_mb() if c.unified else c.kv_gpu_free()
 
     # ---------------- arrivals ----------------
     def admit_arrivals(self):
@@ -472,7 +486,17 @@ class ContinuousBatchSim:
 
     def _demote_or_drop_adapter(self, a):
         c = self.cache
-        if c.unified:
+        if c.unified and c.adapter_cpu_mb > 0:
+            while c.a_cpu_free() < self.adapter_size:
+                cpu = [x for x, t in c.a_tier.items() if t == "acpu"]
+                if not cpu:
+                    break
+                c.drop_adapter(min(cpu, key=lambda x: self.policy.a_last.get(x, -1)))
+            if c.a_cpu_free() >= self.adapter_size:
+                c.place_adapter(a, "acpu")
+            else:
+                c.drop_adapter(a)
+        elif c.unified:
             if c.cpu_mb > 0 and c.cpu_free() >= self.adapter_size:
                 c.place_adapter(a, "cpu")
             else:
@@ -656,13 +680,24 @@ class ContinuousBatchSim:
                 continue
 
             convo = self.convos[r.conversation_id]
-            prompt_tokens = convo.kv_cache_size     # history so far = prompt for this turn
             kv_ms, recompute = self.ensure_kv_resident(r.conversation_id, a)
             swap_ms_this_step += kv_ms
 
-            # tokens this turn must (re)prefill: recompute history if not cached,
-            # else 0 for the already-cached history; the NEW output tokens are decode.
-            to_prefill = recompute
+            # this turn's NEW user-prompt tokens: always prefilled, and they
+            # extend the conversation's KV (room is made for them first).
+            new_in = getattr(r, "input_tokens", 0)
+            if new_in > 0:
+                convo.grow_cache(new_in)
+                if self.cache.kv_on_gpu(r.conversation_id):
+                    self.make_room_for_kv(new_in * self.mb_per_token,
+                                          protect_cid=r.conversation_id)
+                    self.cache.set_kv_size(r.conversation_id,
+                                           convo.kv_cache_size * self.mb_per_token)
+            prompt_tokens = convo.kv_cache_size     # history + this turn's prompt
+
+            # tokens this turn must (re)prefill: recompute history if not cached
+            # (0 if it was), plus the new prompt; the output tokens are decode.
+            to_prefill = recompute + new_in
             seq = SeqState(r, r.conversation_id, a, to_prefill, self.now)
             seq.decode_left = r.output_tokens
             # if history WAS cached, prefill_left is 0 and we go straight to decode
@@ -726,7 +761,12 @@ class ContinuousBatchSim:
                 convo = self.convos[s.cid]
                 convo.grow_cache(1)
                 if self.cache.kv_on_gpu(s.cid):
+                    # make room for the new token's KV (earlier versions grew
+                    # without checking and silently overran the pool)
+                    self.make_room_for_kv(self.mb_per_token, protect_cid=s.cid)
                     self.cache.set_kv_size(s.cid, convo.kv_cache_size * self.mb_per_token)
+                    self.overcommit_peak_mb = max(self.overcommit_peak_mb,
+                                                  -self._free_mb())
             if s.done():
                 s.req.finish(self.now - s.req.arrival_time)
                 self.finished.append(s.req)
@@ -746,6 +786,8 @@ class ContinuousBatchSim:
                 continue
             self.stale_samples.append(self.stale_pct())
             self.step()
+            self.kv_peak_mb = max(self.kv_peak_mb, sum(
+                self.cache.kv_size(c) for c in self.cache.gpu_kv()))
             guard += 1
             if guard > 5_000_000:
                 raise RuntimeError("step loop did not terminate")
@@ -756,10 +798,26 @@ class ContinuousBatchSim:
 # Harness
 # ==========================================================================
 
-def workload(seed):
-    return make_multi_turn_workload(n_conversations=40, n_adapters=12,
-                                    turns_per_convo=5, mean_tokens=40,
-                                    rate=0.0006, turn_gap=6000, seed=seed)
+# Two workloads. `toy` is the original (12 adapters, 40-token replies, no user
+# prompts): every conversation's KV is tiny, so KV memory is never really
+# under pressure. `chat` is the realistic default: ELORA's smallest setup
+# (20 LoRAs), chat-sized turns (~200 new prompt tokens, ~200 reply tokens;
+# LMSYS / ShareGPT scale), and a longer think-time between turns.
+WORKLOADS = {
+    "toy":  dict(n_conversations=40, n_adapters=12, turns_per_convo=5,
+                 mean_tokens=40, rate=0.0006, turn_gap=6000,
+                 mean_input_tokens=0),
+    "chat": dict(n_conversations=80, n_adapters=20, turns_per_convo=5,
+                 mean_tokens=200, rate=0.0006, turn_gap=15000,
+                 mean_input_tokens=200),
+}
+
+
+def workload(seed, mean_input_tokens=None, kind="toy"):
+    kw = dict(WORKLOADS[kind])
+    if mean_input_tokens is not None:
+        kw["mean_input_tokens"] = mean_input_tokens
+    return make_multi_turn_workload(seed=seed, **kw)
 
 
 def build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu, cap, cpu,
@@ -767,14 +825,30 @@ def build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu, cap, cpu,
     if pool == "separate":
         return SeparateCache(adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu,
                              adapter_size=adapter_size)
-    return UnifiedCache(cap, cpu, adapter_size=adapter_size)
+    return UnifiedCache(cap, cpu, adapter_size=adapter_size,
+                        adapter_cpu_mb=adapter_cpu)
 
 
 def trial(pool, max_loras, policy_name, seed, adapter_size,
-          kv_gpu_mb=4000, adapter_cpu=0, kv_cpu=0, unified_cap=4000, unified_cpu=0,
-          hw="ours"):
-    convos, reqs = workload(seed)
+          kv_gpu_mb=None, adapter_cpu=None, kv_cpu=0, unified_cap=4000, unified_cpu=0,
+          hw="ours", mean_input_tokens=None, kind="toy"):
+    """Defaults make the two architectures comparable:
+      kv_gpu_mb=None   -> unified_cap - adapter slab, so BOTH get the same
+                          total GPU MB (earlier versions gave the separate
+                          pool 4000 MB of KV ON TOP of the slab).
+      adapter_cpu=None -> a host-RAM adapter cache holding EVERY adapter, for
+                          BOTH pools: after an adapter's first (disk) load, a
+                          reload is a CPU->GPU copy. That is what an operator
+                          serving N adapters configures (vLLM:
+                          --max-cpu-loras N; ELORA: 256 GB host memory).
+                          vLLM's out-of-the-box default is max_cpu_loras =
+                          max_loras; pass --adapter-cpu to model it."""
+    convos, reqs = workload(seed, mean_input_tokens, kind)
     adapter_mb = max_loras * adapter_size
+    if kv_gpu_mb is None:
+        kv_gpu_mb = max(0.0, unified_cap - adapter_mb)
+    if adapter_cpu is None:
+        adapter_cpu = WORKLOADS[kind]["n_adapters"] * adapter_size
     cache = build_cache(pool, adapter_mb, kv_gpu_mb, adapter_cpu, kv_cpu,
                         unified_cap, unified_cpu, adapter_size)
     policy = POLICIES[policy_name]()
@@ -797,6 +871,13 @@ def trial(pool, max_loras, policy_name, seed, adapter_size,
         "kv_recompute": sim.kv_recomputes,
         "recompute_tokens": sim.recompute_tokens,
         "steps": sim.steps,
+        "overcommit": sim.overcommit_peak_mb,
+        "mean_lat": sum(lats) / len(lats),
+        "ttft_mean": sum(ttfts) / len(ttfts),
+        "load_s": (sim.adapter_from_disk * sim.swap_cold_ms
+                   + sim.adapter_from_cpu * sim.swap_warm_ms) / 1000,
+        "rebuild_s": sim.recompute_tokens * sim.prefill_ms_per_token / 1000,
+        "kv_peak": sim.kv_peak_mb,
     }
 
 
@@ -808,24 +889,41 @@ def avg(**kw):
     return {k: sum(r[k] for r in rows) / SEEDS for k in rows[0]}
 
 
+DEFAULTS = {   # per workload: total GPU MB, max_loras sweep
+    "chat": dict(cap=6000.0, max_loras=[20, 10, 6, 4]),
+    "toy":  dict(cap=4000.0, max_loras=[12, 7, 5, 3]),
+}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--workload", choices=["chat", "toy"], default="chat",
+                    help="chat (default): 20 adapters, ~200-token prompts and "
+                         "replies. toy: the original 12-adapter, 40-token, "
+                         "no-prompt workload")
     ap.add_argument("--pool", choices=["separate", "unified", "both"], default="both")
     ap.add_argument("--adapter-mb", type=float, default=float(ADAPTER_MB),
                     help=f"MB per adapter. core.ADAPTER_MB={ADAPTER_MB} "
-                         f"(rank-32 all-linear, ELORA's rank). Sweep 20/90/180 "
-                         f"to check the pathology is size-robust.")
+                         f"(rank-32 all-linear, ELORA's rank).")
     ap.add_argument("--policy", default=None,
                     help="blind|signal|cost-aware|kv-first ; default sweeps a set")
-    ap.add_argument("--kv-gpu", type=float, default=4000.0,
-                    help="separate-pool KV region MB (realistic single-GPU size)")
+    ap.add_argument("--kv-gpu", type=float, default=None,
+                    help="separate-pool KV region MB. Default: --unified-cap minus "
+                         "the adapter slab, so both architectures get equal total MB")
     ap.add_argument("--kv-cpu", type=float, default=0.0)
-    ap.add_argument("--adapter-cpu", type=float, default=0.0)
-    ap.add_argument("--unified-cap", type=float, default=4000.0,
-                    help="unified pool MB. Working set ~12*adapter + ~1000 KV.")
+    ap.add_argument("--adapter-cpu", type=float, default=None,
+                    help="CPU adapter cache MB, both pools. Default: every "
+                         "adapter. vLLM's out-of-box default is max_loras "
+                         "adapters (max_cpu_loras)")
+    ap.add_argument("--unified-cap", type=float, default=None,
+                    help="total GPU MB for EITHER architecture (unified pool size; "
+                         "separate = slab + KV of the same total). Default: "
+                         "6000 chat / 4000 toy")
+    ap.add_argument("--input-tokens", type=float, default=None,
+                    help="override mean NEW user-prompt tokens per turn")
     ap.add_argument("--unified-cpu", type=float, default=0.0)
-    ap.add_argument("--max-loras", type=int, nargs="+", default=[12, 7, 5, 3])
+    ap.add_argument("--max-loras", type=int, nargs="+", default=None)
     ap.add_argument("--hw", default="ours",
                     choices=["ours", "elora", "elora-aggressive", "elora-conservative"],
                     help="hardware profile: OURS (~A10, PCIe 40GB/s) or ELORA's "
@@ -836,6 +934,10 @@ def main():
     ap.add_argument("--prefill-ms-per-token", type=float, default=None)
     ap.add_argument("--swap-cold-ms", type=float, default=None)
     args = ap.parse_args()
+    d = DEFAULTS[args.workload]
+    cap = args.unified_cap if args.unified_cap is not None else d["cap"]
+    mls = args.max_loras or d["max_loras"]
+    n_adapters = WORKLOADS[args.workload]["n_adapters"]
 
     hw = get_profile(args.hw)
     _ov = {}
@@ -847,37 +949,48 @@ def main():
         hw = _replace(hw, **_ov)
 
     print(__doc__)
-    print(f"continuous batching | hw={hw.name} pcie={hw.pcie_ms_per_mb:.4f} "
-          f"decode={hw.decode_ms_per_token:.2f} | adapter={args.adapter_mb:.0f}MB "
-          f"| KV GPU {args.kv_gpu:.0f}MB | mean of {SEEDS} seeds\n")
+    print(f"continuous batching | workload={args.workload} ({n_adapters} adapters) "
+          f"| hw={hw.name} | adapter={args.adapter_mb:.0f}MB | total GPU {cap:.0f}MB "
+          f"| mean of {SEEDS} seeds\n")
+    print("columns: mean = mean end-to-end latency (ms); TTFT = mean time to first\n"
+          "token; load s / rebuild s = total seconds spent loading adapters /\n"
+          "re-prefilling evicted KV, summed over the run\n")
 
     pools = ["separate", "unified"] if args.pool == "both" else [args.pool]
+    rows = []
     for pool in pools:
         if pool == "separate":
-            policies = [args.policy] if args.policy else ["blind", "signal", "cost-aware"]
-            cap_note = f"adapter slab = max_loras x {args.adapter_mb:.0f}MB, KV pool {args.kv_gpu:.0f}MB"
+            policies = [args.policy] if args.policy else ["blind", "cost-aware"]
+            label = "SEPARATE (vLLM: adapter slab of max_loras slots + KV region)"
         else:
-            policies = [args.policy] if args.policy else ["blind", "kv-first", "cost-aware"]
-            cap_note = f"one pool {args.unified_cap:.0f}MB"
-        print(f"== {pool.upper()} POOL == ({cap_note})")
-        print(f"{'max_loras':>9} {'policy':>11} {'p50':>8} {'p95':>9} {'TTFT p50':>9}"
-              f" {'TPOT':>7} {'stale KV':>9} {'disk':>6} {'kv recmp':>9}")
-        print("-" * 88)
-        for ml in args.max_loras:
+            policies = [args.policy] if args.policy else ["blind", "kv-first"]
+            label = "UNIFIED (one pool), SAME max_loras batch cap"
+        rows.append((label, pool, policies, None))
+    if "unified" in pools:
+        rows.append((f"UNIFIED, NO batch cap (any of the {n_adapters} adapters "
+                     f"may share a batch)", "unified", ["blind"], n_adapters))
+
+    for label, pool, policies, fixed_ml in rows:
+        print(f"== {label} ==")
+        print(f"{'max_loras':>9} {'slab%':>6} {'policy':>11} {'p50':>7} {'mean':>7}"
+              f" {'TTFT':>6} {'TPOT':>6} {'stale KV':>9} {'load s':>7} {'rebuild s':>9}")
+        print("-" * 86)
+        for ml in mls:
             for pol in policies:
-                m = avg(pool=pool, max_loras=ml, policy_name=pol,
+                m = avg(pool=pool, max_loras=fixed_ml or ml, policy_name=pol,
                         adapter_size=args.adapter_mb, kv_gpu_mb=args.kv_gpu,
                         adapter_cpu=args.adapter_cpu, kv_cpu=args.kv_cpu,
-                        unified_cap=args.unified_cap, unified_cpu=args.unified_cpu,
-                        hw=hw)
-                print(f"{ml:>9} {pol:>11} {m['p50']:>8.0f} {m['p95']:>9.0f}"
-                      f" {m['ttft_p50']:>9.0f} {m['tpot']:>7.2f} {m['stale']:>8.1f}%"
-                      f" {m['disk']:>6.0f} {m['kv_recompute']:>9.0f}")
-            print()
-    print("Expected shape: as max_loras shrinks, admission stalls when a "
-          "(max_loras+1)-th adapter wants in; TTFT + TPOT rise; stale KV climbs\n"
-          "during think-time gaps. Unified pool should let a big idle "
-          "conversation's KV be traded for an adapter slot -> flatter curve.")
+                        unified_cap=cap, unified_cpu=args.unified_cpu,
+                        hw=hw, mean_input_tokens=args.input_tokens,
+                        kind=args.workload)
+                slab = (f"{100 * ml * args.adapter_mb / cap:5.0f}%"
+                        if pool == "separate" else f"{'-':>6}")
+                print(f"{(fixed_ml or ml):>9} {slab} {pol:>11} {m['p50']:>7.0f}"
+                      f" {m['mean_lat']:>7.0f} {m['ttft_mean']:>6.0f} {m['tpot']:>6.1f}"
+                      f" {m['stale']:>8.1f}% {m['load_s']:>7.1f} {m['rebuild_s']:>9.1f}")
+            if fixed_ml:
+                break
+        print()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # Validation harness — simulator vs. real vLLM
 
+> **Current plan: phase 7 on one A100. See `GPU_RUN.md`** (`make_adapters.py`,
+> `workload_p7.py`, `run_p7.sh`, `compare_p7.py`). The Sweep A material below
+> is the older phase 2 plan.
+
 Turns `VALIDATION_PLAN.md` into runnable code. The goal is Sweep A: confirm the
 phase-2 stale-KV pathology (p50 rises, adapter reloads climb as `--max-loras`
 shrinks) reproduces on real hardware, and check whether the shape matches the

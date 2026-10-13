@@ -1,12 +1,12 @@
 """Standalone analysis: does any single HARDWARE constant flip phase 7's
 swapper from net-negative to net-positive?
 
-Imports phase7_cost_swapper as a library and sweeps swap-cold-ms and
+Imports archive/phase7_heuristic_swapper (the original phase 7) as a library and sweeps swap-cold-ms and
 decode-ms-per-token across a geometric range at burst x10, from the `ours`
 engine baseline. Emits a markdown table + a one-line verdict per constant.
 
 Result (as of writing): NEITHER constant flips the sign -- see
-phase7_cost_swapper.py's docstring. The flip needs the POLICY switch
+archive/phase7_heuristic_swapper.py's docstring. The flip needs the POLICY switch
 (--swap-out-when full). This script exists to make that negative result
 reproducible without re-deriving it by hand.
 
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataclasses import replace
 from core import OURS
-from phase7_cost_swapper import avg
+from archive.phase7_heuristic_swapper import avg
 
 BURST = 10.0
 POOL_MB = 2400.0
@@ -75,7 +75,7 @@ def main():
     for field, values in SWEEPS:
         one(field, values)
     print("---\n")
-    print("See `phase7_cost_swapper.py --sweep` for the switch attribution: "
+    print("See `archive/phase7_heuristic_swapper.py --sweep` for the switch attribution: "
           "`--swap-out-when full` is the single change that flips the sign "
           "(-21.6% -> +2.2% at burst x10).")
 

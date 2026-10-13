@@ -20,6 +20,10 @@ MB_PER_TOKEN = 0.125      # 8B model, GQA, fp16: 2*32layers*8heads*128dim*2bytes
 # are either 32 or 64", so this matches the architecture we compare against.
 # Earlier drafts used 20 MB (rank-8, q/v-only) -- a narrow-adapter regime;
 # phase 5's --adapter-mb sweeps 20/90/180 to show the pathology is size-robust.
+# NOTE: the formula above treats k_proj/v_proj as 4096->4096. Llama-3-8B uses
+# GQA, so they are 4096->1024 and the exact rank-32 figure is ~168 MB. Kept at
+# 180 (within ~7%; rank-64 adapters are 2x) since results depend on the
+# adapters-that-fit ratio, not the absolute MB.
 ADAPTER_MB = 180
 PREFILL_MS_PER_TOKEN = 0.15   # compute-bound, parallel across the prompt
 DECODE_MS_PER_TOKEN = 12      # bandwidth-bound, one full pass per token
@@ -88,8 +92,22 @@ ELORA_CONSERVATIVE = replace(
     decode_ms_per_token=DECODE_MS_PER_TOKEN * 0.35,
 )
 
+# A100 80GB (SXM or PCIe), PCIe 4.0 x16 to host (~25 GB/s usable). ROUGH:
+# prefill ~0.09 ms/token for an 8B model (~16 GFLOP/token at ~55% of 312
+# TFLOPS); decode ~10 ms/step at small batch (16 GB of weights at ~2 TB/s plus
+# LoRA kernels). Used only to PREDICT the validation/ GPU run; replace with
+# measured values once that run exists.
+A100 = HardwareProfile(
+    name="a100", mb_per_token=MB_PER_TOKEN, adapter_mb=ADAPTER_MB,
+    prefill_ms_per_token=0.09, decode_ms_per_token=10.0,
+    swap_cold_ms=SWAP_COLD_MS, swap_warm_ms=SWAP_WARM_MS * (0.045 / 0.105),
+    pcie_ms_per_mb=0.045,
+    swap_mode="async", prefetch_cost="overlapped", swap_out_when="full",
+)
+
 PROFILES = {
     "ours": OURS,
+    "a100": A100,
     "elora": ELORA_AGGRESSIVE,
     "elora-aggressive": ELORA_AGGRESSIVE,
     "elora-conservative": ELORA_CONSERVATIVE,
@@ -106,11 +124,18 @@ def get_profile(x):
 class Request:
     """One turn. Knows its own facts, guards its own transitions."""
 
-    def __init__(self, request_id, conversation_id, output_tokens, arrival_time):
+    def __init__(self, request_id, conversation_id, output_tokens, arrival_time,
+                 input_tokens=0):
         self.request_id = request_id
         self.conversation_id = conversation_id
         self.arrival_time = arrival_time
         self.output_tokens = output_tokens
+        # NEW user-prompt tokens this turn adds (on top of the conversation's
+        # history). Phases 5-7 prefill them and grow the conversation's KV by
+        # them. Earlier versions had no input tokens at all, which made every
+        # conversation's KV ~20x smaller than real traffic (Mooncake median
+        # prompt: 6,909 tokens) and recompute nearly free.
+        self.input_tokens = input_tokens
         self.end_time = None
 
     def latency(self):
@@ -158,6 +183,14 @@ def summarize(finished):
     }
 
 
+def _draw_input(rng, mean):
+    """New user-prompt tokens for one turn: exponential with the given mean
+    (heavy-ish tail, like real chat), 0 when mean is 0."""
+    if mean <= 0:
+        return 0
+    return max(1, int(rng.expovariate(1.0 / mean)))
+
+
 def make_single_turn_workload(n_requests=1200, n_adapters=30, skew=1.0,
                               rate=0.01, mean_tokens=48, seed=0):
     """Phase 1: independent requests, no conversation state.
@@ -185,11 +218,14 @@ def make_single_turn_workload(n_requests=1200, n_adapters=30, skew=1.0,
 
 def make_multi_turn_workload(n_conversations=40, n_adapters=12, turns_per_convo=5,
                              skew=1.0, rate=0.0006, mean_tokens=40,
-                             turn_gap=6000.0, seed=0):
+                             turn_gap=6000.0, seed=0, mean_input_tokens=0):
     """Phases 2-4: conversations that emit several turns over time.
 
     rate     : conversation starts per ms
     turn_gap : mean think-time between turns of one conversation (ms)
+    mean_input_tokens : mean NEW user-prompt tokens per turn (exponential).
+      0 reproduces the original zero-prompt workload exactly. Drawn from a
+      separate RNG so every other draw is unchanged by this knob.
     """
     rng = random.Random(seed)
     weights = [1.0 / (r ** skew) for r in range(1, n_adapters + 1)]
@@ -200,6 +236,7 @@ def make_multi_turn_workload(n_conversations=40, n_adapters=12, turns_per_convo=
     requests = []
     rid = 0
     t = 0.0
+    in_rng = random.Random(seed + 7919)
     for cid in range(n_conversations):
         t += rng.expovariate(rate)
         adapter = rng.choices(adapter_ids, weights=weights, k=1)[0]
@@ -207,7 +244,8 @@ def make_multi_turn_workload(n_conversations=40, n_adapters=12, turns_per_convo=
         turn_time = t
         for _ in range(turns_per_convo):
             tokens = max(10, int(rng.gauss(mean_tokens, mean_tokens * 0.3)))
-            requests.append(Request(rid, cid, tokens, turn_time))
+            requests.append(Request(rid, cid, tokens, turn_time,
+                                    _draw_input(in_rng, mean_input_tokens)))
             rid += 1
             turn_time += rng.expovariate(1.0 / turn_gap)
     return conversations, requests
@@ -217,7 +255,7 @@ def make_prefix_sharing_workload(n_conversations=40, n_adapters=12,
                                  turns_per_convo=5, skew=1.0, rate=0.0006,
                                  mean_tokens=40, turn_gap=6000.0,
                                  shared_prefix_tokens=0, shared_prefix_groups=3,
-                                 seed=0):
+                                 seed=0, mean_input_tokens=0):
     """Phase 6: like make_multi_turn_workload, but conversations are split into
     `shared_prefix_groups` groups and every conversation in a group shares the
     same first `shared_prefix_tokens` tokens -- a "system prompt" that a radix
@@ -248,6 +286,7 @@ def make_prefix_sharing_workload(n_conversations=40, n_adapters=12,
     requests = []
     rid = 0
     t = 0.0
+    in_rng = random.Random(seed + 7919)
     for cid in range(n_conversations):
         t += rng.expovariate(rate)
         adapter = rng.choices(adapter_ids, weights=weights, k=1)[0]
@@ -260,7 +299,8 @@ def make_prefix_sharing_workload(n_conversations=40, n_adapters=12,
         turn_time = t
         for turn_idx in range(turns_per_convo):
             tokens = max(10, int(rng.gauss(mean_tokens, mean_tokens * 0.3)))
-            r = Request(rid, cid, tokens, turn_time)
+            r = Request(rid, cid, tokens, turn_time,
+                        _draw_input(in_rng, mean_input_tokens))
             r.is_first_turn = (turn_idx == 0)
             requests.append(r)
             rid += 1
@@ -274,7 +314,7 @@ def make_bursty_workload(n_conversations=60, n_adapters=12, turns_per_convo=5,
                          shared_prefix_groups=3,
                          burst_factor=5.0, burst_period=40000.0,
                          burst_duty=0.25, popularity_drift_period=60000.0,
-                         seed=0):
+                         seed=0, mean_input_tokens=0):
     """Phase 7: bursty arrivals + drifting adapter popularity.
 
     ELORA drives arrivals from the Microsoft Azure Function trace -- bursty,
@@ -324,6 +364,7 @@ def make_bursty_workload(n_conversations=60, n_adapters=12, turns_per_convo=5,
     requests = []
     rid = 0
     t = 0.0
+    in_rng = random.Random(seed + 7919)
     for cid in range(n_conversations):
         # thin an inhomogeneous Poisson process: step with the max rate,
         # accept a point with prob rate_at(t)/max_rate
@@ -343,7 +384,8 @@ def make_bursty_workload(n_conversations=60, n_adapters=12, turns_per_convo=5,
         turn_time = t
         for turn_idx in range(turns_per_convo):
             tokens = max(10, int(rng.gauss(mean_tokens, mean_tokens * 0.3)))
-            r = Request(rid, cid, tokens, turn_time)
+            r = Request(rid, cid, tokens, turn_time,
+                        _draw_input(in_rng, mean_input_tokens))
             r.is_first_turn = (turn_idx == 0)
             requests.append(r)
             rid += 1

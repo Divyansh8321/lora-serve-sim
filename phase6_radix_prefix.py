@@ -30,75 +30,67 @@ QUESTION: as `shared_prefix_tokens` grows 0 -> 1600, does a dependency-aware
        eviction policy open a gap over plain ordering?
 
 POLICIES (all on the unified pool, continuous batching):
-  lru-leaf      : evict least-recently-used leaf, ignore which LoRA it is under
-  ordering      : phase-4 "kv-first" -- evict the biggest KV subtree before
+  lru-leaf      : evict the least-recently-used LEAF (a resident node with no
+                  resident children), ignoring which LoRA it is under. This is
+                  SGLang RadixAttention's own rule.
+  ordering      : phase-4 "kv-first" -- evict the biggest KV node before
                   touching any adapter; within KV, biggest-then-LRU
-  dep-aware     : ELORA-style -- never evict a LoRA whose subtree still holds
-                  recently-used KV; rank KV leaves by (is-stale, -shared_by,
-                  size, LRU) so a widely-shared prefix is evicted last
+  dep-aware     : OUR heuristic, not ELORA's algorithm -- never evict a LoRA
+                  whose subtree still holds recently-used KV; rank KV by
+                  (is-stale, shared_by, size, LRU). See ELORA_ALIGNMENT.md for
+                  how ELORA's real cost model differs.
 
-FINDING (mean over 5 seeds, adapter 180MB, 3 prefix groups):
+FINDING (mean over 5 seeds, adapter 180MB, 3 prefix groups).
+  Re-run 2026-10-11 after fixing an lru-leaf bug (see AUDIT below).
 
-  GENEROUS pool (3000MB), varying shared prefix length:
-    prefix tok   policy       p50   TTFT p50   stale KV   dep vs ordering
-         0       (all three)  689      23        0.0%        0.0%
-       400       ordering     732      29        0.0%
-       400       dep-aware    715      32        0.0%       +2.2%
-       800       ordering     842     102        0.0%
-       800       dep-aware    785      38        0.0%       +6.7%
-      1600       ordering    1214     277        0.4%
-      1600       dep-aware   1160     220        0.1%       +4.5%
-      3200       ordering    5583    2061        4.0%
-      3200       dep-aware   5327    1837        3.4%       +4.6%
-      6400       ordering   39747   36007        4.0%
-      6400       dep-aware  39737   36007        3.9%       +0.0%
+  GENEROUS pool (3000MB), no user-prompt tokens (--input-tokens 0):
+    prefix tok   lru-leaf   ordering   dep-aware   (p50 ms)
+         0          689        689        689
+       400          707        731        714
+       800          796        841        785
+      1600         1122       1216       1161
+      3200         5456       5637       5337
+      6400        39737      39747      39737      (pool can't hold the prefix)
 
-  The dependency-aware advantage is a MID-RANGE effect. It needs the shared
-  prefix big enough to matter (>400 tok) but small enough that keeping it
-  resident is FEASIBLE (roughly <10% of pool). At 6400 tok / 800MB on a
-  3000MB pool, neither policy can hold the prefix -- the system thrashes
-  (p50 ~40s, 36k recomputes) and dep-aware == ordering because there is no
-  good decision left to make. Outside the band -- too small to matter, or
-  too big to save -- the sophisticated policy earns nothing.
+  SQUEEZED pool (1800MB, default): all three within ~2% at every length.
+  --hw elora-aggressive (3000MB): all three within ~2%.
 
-  TWO results, and the smaller one is ELORA's:
+  WITH REALISTIC PROMPTS (--input-tokens 600, i.e. KV sized like real chat):
+    pool 6000MB    prefix 0/400/800/1600:  dep-aware is 16-35% WORSE than
+                   ordering; lru-leaf ~= ordering
+    pool 10000MB   dep-aware 18-54% worse than ordering; lru-leaf ~= ordering
 
-  1. PREFIX-STRUCTURE AWARENESS MATTERS A LOT. `lru-leaf` -- blind LRU over
-     leaves -- collapses as the shared prefix grows: p50 884 at 400 tokens,
-     28553 at 1600. It evicts shared prefix nodes that many sequences need,
-     forcing everyone to re-prefill. Any policy that does NOT blindly
-     LRU-evict a shared node avoids this -- including `ordering`, which
-     evicts biggest-single-node-first (a shared prefix under an active
-     adapter is neither the biggest node nor unpinned).
+  READING:
+  1. Plain LRU over the radix tree is never meaningfully beaten. It ties or
+     beats `ordering` everywhere and is within ~1-3% of `dep-aware` without
+     prompts.
+  2. Our `dep-aware` heuristic's small edge over `ordering` (+2-7%, no
+     prompts) is an edge over a WEAK baseline (`ordering` evicts the shared
+     prefix first because it is the biggest node), not over LRU. With
+     realistic prompt sizes our heuristic is clearly harmful (its
+     "small nodes first" rule evicts many live conversations).
+  3. None of this tests ELORA's actual design: ELORA's LoRAs are INTERNAL tree
+     nodes (parents of their KV), eviction is leaf-only so a LoRA cannot leave
+     while its KV is resident, and evicted data is SWAPPED to host memory, not
+     destroyed. This sim drops evicted KV (recompute) and has no host tier.
+     See ELORA_ALIGNMENT.md.
 
-  2. THE DEPENDENCY SCORING ELORA LAYERS ON TOP IS WORTH ~2-7%. dep-aware
-     beats ordering by +2% to +7% p50 (and much better TTFT: 38 vs 102 at
-     800 tokens) by protecting an adapter whose subtree still holds live
-     shared KV and evicting widely-shared prefixes last. Real, consistent,
-     grows with sharing -- but nowhere near ELORA's claimed 1.51x for their
-     full dependency manager vs ELORA-WOM.
-
-  RECONCILIATION with ELORA-WOM's 1.51x: ELORA-WOM removes the dependency
-  manager ENTIRELY -- it is closer to our `lru-leaf` (which DOES collapse,
-  ~40x) than to `ordering`. ELORA's paper never isolates "prefix-aware
-  ordering, no dependency scoring", which is the cheap policy that captures
-  most of the win here. Honest read: the pathology is real, prefix structure
-  must be respected, but simple ordering discipline -- not elaborate
-  dependency scoring -- does the heavy lifting.
-
-  SQUEEZED pool (1800MB, the default): same ranking, gap compressed to
-  +0.6-2.7% because eviction is so frequent all policies thrash. lru-leaf
-  still collapses.
-
-HARDWARE PROFILE (--hw): phase 6 has no CPU/PCIe KV path, so --hw only moves
-  decode/prefill/swap-cold/adapter. At --hw elora-aggressive the dep-aware vs
-  ordering gap SHRINKS (800 tok: +6.7% -> +2.2%): faster compute makes the
-  recompute penalty that dep-aware avoids cheaper, so protecting shared
-  prefixes matters less. lru-leaf still degrades under sharing but less
-  catastrophically (315 -> 271 at 800 tok, vs 884 -> 785 at --hw ours).
-  Reading: dependency-scoring's value is INVERSELY related to hardware speed
-  -- another reason ELORA's 1.51x (measured on H800) does not transfer to a
-  slower single GPU as a policy claim.
+AUDIT (2026-10-11) -- what changed and why:
+  * BUG: lru-leaf used the structural is_leaf() ("no children ever").
+    Children are never pruned, so a shared prefix node could NEVER be
+    evicted; prefix nodes filled the pool (peak 3000/3000MB at 1600 tok).
+    The previously reported "lru-leaf collapses ~40x" (p50 28553 at 1600 tok)
+    and the claim that "prefix-aware ordering does the heavy lifting" were
+    artifacts of that bug. Fixed: leaf = no RESIDENT children; evicting a
+    leaf can expose its parent (RadixAttention semantics).
+  * BUG: decode growth resized KV without making room, overrunning the pool
+    (up to ~70MB). Fixed: make_room before growth; overcommit_peak_mb records
+    any residual (only possible when every resident node is pinned).
+  * GAP: no user-prompt tokens existed. Added Request.input_tokens and
+    --input-tokens (default 0 reproduces the original workload exactly).
+  * The "reconciliation with ELORA-WOM" (WOM ~= our collapsing lru-leaf) is
+    withdrawn: it rested on the bug, and ELORA-WOM keeps ELORA's cost-model
+    swapper -- it is not blind LRU.
 
 Run:  python phase6_radix_prefix.py
       python phase6_radix_prefix.py --hw elora-aggressive --prefix-tokens 0 400 800
@@ -106,6 +98,7 @@ Run:  python phase6_radix_prefix.py
 """
 
 import argparse
+import heapq
 from collections import deque
 
 from dataclasses import replace as _replace
@@ -153,6 +146,11 @@ class RadixNode:
         return self.tokens * MB_PER_TOKEN
 
     def is_leaf(self):
+        """Structural leaf: no child nodes at all. NOTE: children are never
+        pruned, so a prefix node that ever had a conversation is never a
+        structural leaf. Eviction policies must use RadixTree.is_evictable_leaf
+        (no RESIDENT children) instead -- an earlier lru-leaf used this method
+        and could therefore never evict a shared prefix (see LRULeaf)."""
         return not self.children
 
 
@@ -244,6 +242,9 @@ class RadixTree:
             needed += leaf.mb()
         return reused, needed, path
 
+    def has_resident_child(self, node):
+        return any(id(c) in self.resident for c in node.children.values())
+
     # ---- shared_by: how many conversations depend on this prefix node ----
     def shared_by(self, node):
         if not node.is_prefix:
@@ -298,18 +299,38 @@ class Policy:
 
 class LRULeaf(Policy):
     """Evict the LRU resident leaf, regardless of which LoRA it belongs to.
-    If still short, evict LRU adapters. The naive radix baseline."""
+    If still short, evict LRU adapters. The naive radix baseline -- this is
+    SGLang RadixAttention's own eviction rule.
+
+    "Leaf" = a resident node with no RESIDENT children. Once a leaf is evicted
+    its parent may become a leaf and join the candidates (as in RadixAttention).
+    BUG FIXED: an earlier version used the structural is_leaf() ("no children
+    at all"). Children are never pruned, so shared prefix nodes could NEVER be
+    evicted; they filled the pool and produced the "lru-leaf collapses 40x"
+    result, which was an artifact of that bug, not of LRU."""
     name = "lru-leaf"
 
     def choose_evictions(self, tree, adapters_mb, need_mb, pinned_adapters,
                          pinned_nodes):
         ev, freed = [], 0.0
-        leaves = [n for n in tree.resident_nodes()
-                  if n.is_leaf() and id(n) not in pinned_nodes]
-        for n in sorted(leaves, key=lambda x: x.last_used):
-            if freed >= need_mb:
-                return ev
-            ev.append(("kv", n)); freed += n.mb()
+        gone = set()
+
+        def is_leaf(n):
+            return not any(id(c) in tree.resident and id(c) not in gone
+                           for c in n.children.values())
+
+        heap = [(n.last_used, id(n), n) for n in tree.resident_nodes()
+                if id(n) not in pinned_nodes and is_leaf(n)]
+        heapq.heapify(heap)
+        while heap and freed < need_mb:
+            _, _, n = heapq.heappop(heap)
+            ev.append(("kv", n)); freed += n.mb(); gone.add(id(n))
+            p = n.parent
+            if (p is not None and id(p) in tree.resident and id(p) not in gone
+                    and id(p) not in pinned_nodes and is_leaf(p)):
+                heapq.heappush(heap, (p.last_used, id(p), p))
+        if freed >= need_mb:
+            return ev
         for a in sorted([a for a in adapters_mb if a not in pinned_adapters],
                         key=lambda a: self.a_last.get(a, -1)):
             if freed >= need_mb:
@@ -440,6 +461,9 @@ class RadixSim:
         self.ttft = {}
         self.tpot_num = 0.0
         self.tpot_den = 0
+        # growth with every resident node pinned cannot be satisfied without
+        # preempting a running sequence (not modelled): record how far over.
+        self.overcommit_peak_mb = 0.0
 
     # ---------- helpers ----------
     def admit_arrivals(self):
@@ -505,6 +529,23 @@ class RadixSim:
         self.adapter_loads += 1
         return self.swap_cold_ms
 
+    def _add_new_input(self, r, convo, leaf):
+        """This turn's NEW user-prompt tokens: extend the conversation (and its
+        leaf, if resident -- making room first) and return them as prefill.
+        Not counted as recompute: it is first-time work every policy pays."""
+        new_in = getattr(r, "input_tokens", 0)
+        if new_in <= 0:
+            return 0
+        convo.grow_cache(new_in)
+        if self.tree.is_resident(leaf):
+            self.make_room(new_in * MB_PER_TOKEN)
+        self.tree.resize(leaf, convo.kv_cache_size)
+        self._note_overcommit()
+        return new_in
+
+    def _note_overcommit(self):
+        self.overcommit_peak_mb = max(self.overcommit_peak_mb, -self.free_mb())
+
     # ---------- scheduling ----------
     def schedule(self):
         if not self.waiting:
@@ -555,6 +596,7 @@ class RadixSim:
             reused_toks = int(round(reused / MB_PER_TOKEN))
             self.reused_tokens += reused_toks
             self.recompute_tokens += to_prefill
+            to_prefill += self._add_new_input(r, convo, path[-1])
 
             leaf = path[-1]
             seq = SeqState(r, r.conversation_id, a, to_prefill, leaf)
@@ -593,6 +635,7 @@ class RadixSim:
                 to_prefill += n.tokens
             self.policy.touch_node(n, self.now)
         self.recompute_tokens += to_prefill
+        to_prefill += self._add_new_input(r, convo, path[-1])
         seq = SeqState(r, r.conversation_id, a, to_prefill, path[-1])
         for n in path:
             n.refs += 1
@@ -652,7 +695,12 @@ class RadixSim:
                 self.tpot_den += 1
                 convo = self.convos[s.cid]
                 convo.grow_cache(1)
+                if self.tree.is_resident(s.leaf):
+                    # room for the new token's KV (earlier versions grew
+                    # without checking and silently overran the pool)
+                    self.make_room(MB_PER_TOKEN)
                 self.tree.resize(s.leaf, convo.kv_cache_size)
+                self._note_overcommit()
                 if self.tree.is_resident(s.leaf):
                     self.policy.touch_node(s.leaf, self.now)
             if s.done():
@@ -691,11 +739,12 @@ SEEDS = 5
 
 
 def trial(prefix_tokens, policy_name, seed, pool_mb, max_loras=5,
-          groups=3, hw="ours"):
+          groups=3, hw="ours", mean_input_tokens=0):
     convos, reqs = make_prefix_sharing_workload(
         n_conversations=40, n_adapters=12, turns_per_convo=5, mean_tokens=40,
         rate=0.0006, turn_gap=6000, shared_prefix_tokens=prefix_tokens,
-        shared_prefix_groups=groups, seed=seed)
+        shared_prefix_groups=groups, seed=seed,
+        mean_input_tokens=mean_input_tokens)
     sim = RadixSim(reqs, convos, pool_mb, POLICIES[policy_name](),
                    max_loras, prefix_tokens, hw=hw)
     sim.run()
@@ -715,6 +764,7 @@ def trial(prefix_tokens, policy_name, seed, pool_mb, max_loras=5,
         "adapter_loads": sim.adapter_loads,
         "recompute_tokens": sim.recompute_tokens,
         "reuse_frac": reuse_frac,
+        "overcommit": sim.overcommit_peak_mb,
     }
 
 
@@ -733,6 +783,9 @@ def main():
                          "'interesting case'), where ordering beat dep-aware.")
     ap.add_argument("--max-loras", type=int, default=5)
     ap.add_argument("--groups", type=int, default=3)
+    ap.add_argument("--input-tokens", type=float, default=0.0,
+                    help="mean NEW user-prompt tokens per turn (0 = original "
+                         "zero-prompt workload)")
     ap.add_argument("--hw", default="ours",
                     choices=["ours", "elora", "elora-aggressive", "elora-conservative"],
                     help="hardware profile (see core.py). Phase 6 has no CPU/PCIe "
@@ -752,7 +805,7 @@ def main():
 
     print(__doc__)
     print(f"unified pool {args.pool_mb:.0f}MB | max_loras {args.max_loras} | "
-          f"{args.groups} prefix groups | hw={hw.name} "
+          f"{args.groups} prefix groups | input/turn {args.input_tokens:.0f} | hw={hw.name} "
           f"decode={hw.decode_ms_per_token:.2f} | adapter {hw.adapter_mb:.0f}MB | "
           f"mean of {SEEDS} seeds\n")
     print(f"{'prefix tok':>10} {'policy':>10} {'p50':>8} {'p95':>9} {'TTFT p50':>9}"
@@ -762,7 +815,8 @@ def main():
         base = None
         for pol in ["lru-leaf", "ordering", "dep-aware"]:
             m = avg(prefix_tokens=pt, policy_name=pol, pool_mb=args.pool_mb,
-                    max_loras=args.max_loras, groups=args.groups, hw=hw)
+                    max_loras=args.max_loras, groups=args.groups, hw=hw,
+                    mean_input_tokens=args.input_tokens)
             if pol == "ordering":
                 base = m["p50"]
             tag = ""

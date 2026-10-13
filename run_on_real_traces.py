@@ -13,10 +13,10 @@ Fixes two of the "gaps" named in README's Scope & honesty section:
   - phase 7's burstiness was invented (a hand-tuned spike formula). Here
     request arrival timing comes directly from BurstGPT's real gaps.
 
-This does NOT touch phase6_radix_prefix.py / phase7_cost_swapper.py's own
-CLI -- it imports their Sim classes and policies directly and drives them
-with real_traces.py's output, so the phase files' synthetic-workload
-behavior (and all previously-recorded numbers) are unaffected.
+This does NOT touch phase6_radix_prefix.py / phase7_elora.py's own CLI --
+it imports their Sim classes directly and drives them with real_traces.py's
+output. Phase 7 here is the ELORA-faithful rewrite (phase7_elora.py); the
+original heuristic phase 7 is archive/phase7_heuristic_swapper.py.
 
 HONEST LIMITATIONS (see real_traces.py's docstring for detail):
   - Mooncake's variable-depth prefix chains are collapsed to one
@@ -41,7 +41,7 @@ from core import get_profile, percentile
 from real_traces import (load_burstgpt_arrivals, load_mooncake_conversations,
                          load_taskmaster_conversations, load_lmsys_conversations)
 from phase6_radix_prefix import RadixSim, POLICIES as P6_POLICIES
-from phase7_cost_swapper import Phase7Sim, POLICIES as P7_POLICIES
+import phase7_elora as P7
 
 
 def _truncate_to_n_conversations(convos, reqs, n_conversations):
@@ -177,13 +177,40 @@ WORKLOADS = {
 }
 
 
+THINK_MS = 0.0   # set by --think-ms
+
+
+def _add_think_time(reqs, seed, think_ms):
+    """Re-space each conversation's turns with an exponential user think time
+    (mean think_ms). ASSUMED, not real: LMSYS has one timestamp per
+    conversation and Taskmaster has none, so as loaded every turn of a
+    conversation arrives at once. Each conversation's first-turn arrival is
+    kept; only the gaps between its turns change."""
+    import random
+    rng = random.Random(seed * 7907 + 1)
+    by_cid = {}
+    for r in sorted(reqs, key=lambda r: (r.arrival_time, r.request_id)):
+        by_cid.setdefault(r.conversation_id, []).append(r)
+    for turns in by_cid.values():
+        t = turns[0].arrival_time
+        for r in turns[1:]:
+            t += rng.expovariate(1.0 / think_ms)
+            r.arrival_time = t
+    reqs.sort(key=lambda r: r.arrival_time)
+    return reqs
+
+
 def _build(workload, seed, n_conversations, min_adapter_reuse):
     if workload == "mooncake":
-        return build_real_workload(seed, n_conversations=n_conversations,
-                                   min_adapter_reuse=min_adapter_reuse)
-    if workload == "lmsys":
-        return build_lmsys_workload(seed, n_conversations=n_conversations)
-    return build_taskmaster_workload(seed, n_conversations=n_conversations)
+        convos, reqs = build_real_workload(seed, n_conversations=n_conversations,
+                                           min_adapter_reuse=min_adapter_reuse)
+    elif workload == "lmsys":
+        convos, reqs = build_lmsys_workload(seed, n_conversations=n_conversations)
+    else:
+        convos, reqs = build_taskmaster_workload(seed, n_conversations=n_conversations)
+    if THINK_MS > 0:
+        reqs = _add_think_time(reqs, seed, THINK_MS)
+    return convos, reqs
 
 
 def trial_phase6(policy_name, seed, pool_mb, max_loras, hw, n_conversations=2000,
@@ -201,21 +228,13 @@ def trial_phase6(policy_name, seed, pool_mb, max_loras, hw, n_conversations=2000
             "adapter_loads": sim.adapter_loads, "n": len(sim.finished)}
 
 
-def trial_phase7(policy_name, seed, pool_mb, max_loras, hw, n_conversations=2000,
+def trial_phase7(design, seed, gpu_mb, max_loras, hw, n_conversations=2000,
                  min_adapter_reuse=1, workload="mooncake"):
     convos, reqs = _build(workload, seed, n_conversations, min_adapter_reuse)
-    sim = Phase7Sim(reqs, convos, pool_mb, P7_POLICIES[policy_name](),
-                    max_loras, hw=hw)
+    sim = P7.Sim(reqs, convos, P7.DESIGNS[design], gpu_mb, 3.2 * gpu_mb,
+                 max_loras, hw=hw)
     sim.run()
-    lats = [r.latency() for r in sim.finished]
-    ttfts = list(sim.ttft.values())
-    stale = (sum(sim.stale_samples) / len(sim.stale_samples)
-             if sim.stale_samples else 0.0)
-    tpot = sim.tpot_num / sim.tpot_den if sim.tpot_den else float("nan")
-    return {"p50": percentile(lats, 50), "p95": percentile(lats, 95),
-            "ttft_p50": percentile(ttfts, 50), "tpot": tpot, "stale": stale,
-            "adapter_loads": sim.adapter_loads,
-            "prefetch": sim.prefetch_loads, "n": len(sim.finished)}
+    return sim.metrics()
 
 
 WINDOWS = 3  # real-history windows to average over (not synthetic-random seeds)
@@ -262,10 +281,16 @@ def main():
                     help="how many real-history windows to average over")
     ap.add_argument("--hw", default="ours",
                     choices=["ours", "elora", "elora-aggressive", "elora-conservative"])
+    ap.add_argument("--think-ms", type=float, default=0.0,
+                    help="ASSUMED mean user think time between a conversation's "
+                         "turns (exponential). 0 = as loaded: LMSYS and "
+                         "Taskmaster turns then arrive all at once")
+    ap.add_argument("--skip-phase6", action="store_true")
     args = ap.parse_args()
     hw = get_profile(args.hw)
-    global WINDOWS
+    global WINDOWS, THINK_MS
     WINDOWS = args.windows
+    THINK_MS = args.think_ms
 
     print(__doc__)
     convos, reqs = _build(args.workload, seed=0, n_conversations=args.n_conversations,
@@ -289,36 +314,47 @@ def main():
           f"~40% of {n_adapters} real adapters) | mean of {WINDOWS} real-history windows\n")
     args.pool_mb, args.max_loras = pool_mb, max_loras
 
-    print("== PHASE 6 policies on REAL prefix-sharing structure ==")
-    print(f"{'policy':>12} {'p50':>8} {'p95':>9} {'TTFT p50':>9} {'stale KV':>9}")
-    print("-" * 52)
-    base = None
-    for pol in ["lru-leaf", "ordering", "dep-aware"]:
-        m = avg(trial_phase6, policy_name=pol, pool_mb=args.pool_mb,
-                max_loras=args.max_loras, hw=hw, n_conversations=args.n_conversations,
-                min_adapter_reuse=args.min_adapter_reuse, workload=args.workload)
-        if pol == "ordering":
-            base = m["p50"]
-        tag = f"  dep vs ord {100*(base-m['p50'])/base:+.1f}%" if base and pol == "dep-aware" else ""
-        print(f"{pol:>12} {m['p50']:>8.0f} {m['p95']:>9.0f} {m['ttft_p50']:>9.0f}"
-              f" {m['stale']:>8.1f}%{tag}")
+    if not args.skip_phase6:
+        print("== PHASE 6 policies on REAL prefix-sharing structure ==")
+        print(f"{'policy':>12} {'p50':>8} {'p95':>9} {'TTFT p50':>9} {'stale KV':>9}")
+        print("-" * 52)
+        base = None
+        for pol in ["lru-leaf", "ordering", "dep-aware"]:
+            m = avg(trial_phase6, policy_name=pol, pool_mb=args.pool_mb,
+                    max_loras=args.max_loras, hw=hw, n_conversations=args.n_conversations,
+                    min_adapter_reuse=args.min_adapter_reuse, workload=args.workload)
+            if pol == "ordering":
+                base = m["p50"]
+            tag = f"  dep vs ord {100*(base-m['p50'])/base:+.1f}%" if base and pol == "dep-aware" else ""
+            print(f"{pol:>12} {m['p50']:>8.0f} {m['p95']:>9.0f} {m['ttft_p50']:>9.0f}"
+                  f" {m['stale']:>8.1f}%{tag}")
 
     timing_src = "LMSYS's own real timestamps" if args.workload == "lmsys" else "BurstGPT"
-    print(f"\n== PHASE 7 policies on REAL arrival timing ({timing_src}) ==")
-    print(f"{'policy':>16} {'p50':>8} {'p95':>9} {'TTFT p50':>9} {'TPOT':>7}"
-          f" {'stale KV':>9} {'ldrs':>6}   vs react-lru")
-    print("-" * 78)
-    base = None
-    for pol in ["react-lru", "react-dep", "swap-full", "swap-noprefetch"]:
-        m = avg(trial_phase7, policy_name=pol, pool_mb=args.pool_mb,
-                n_conversations=args.n_conversations, min_adapter_reuse=args.min_adapter_reuse,
-                max_loras=args.max_loras, hw=hw, workload=args.workload)
-        if pol == "react-lru":
-            base = m["p50"]
-        delta = f"{100*(base-m['p50'])/base:+.1f}%" if base else ""
-        print(f"{pol:>16} {m['p50']:>8.0f} {m['p95']:>9.0f} {m['ttft_p50']:>9.0f}"
-              f" {m['tpot']:>7.2f} {m['stale']:>8.1f}% {m['adapter_loads']:>6.0f}"
-              f"   {delta:>10}")
+    p7_ml = sorted({P7.default_max_loras(args.pool_mb, hw), args.max_loras})
+    print(f"\n== PHASE 7 (ELORA-faithful) on REAL arrival timing ({timing_src}) ==")
+    print(f"GPU {args.pool_mb:.0f} MB, host {3.2 * args.pool_mb:.0f} MB; vLLM max_loras "
+          f"{p7_ml} (0.2 ratio, and the phase-6 value); best vLLM = oracle")
+    print(P7.HEADER)
+    print("-" * len(P7.HEADER))
+    rows = {}
+    for d in ["vllm", "vllm-offload", "slora", "elora", "elora-wos", "elora-nohost"]:
+        for v in (p7_ml if d.startswith("vllm") else [args.max_loras]):
+            m = avg(trial_phase7, design=d, gpu_mb=args.pool_mb, max_loras=v, hw=hw,
+                    n_conversations=args.n_conversations,
+                    min_adapter_reuse=args.min_adapter_reuse, workload=args.workload)
+            label = f"{d} ml={v}" if d.startswith("vllm") else d
+            print(P7.fmt(label, m))
+            if m["dropped"]:
+                continue                           # cannot serve this load
+            if d not in rows or m["ttft"] < rows[d]["ttft"]:
+                rows[d] = m
+    o = rows["vllm"]
+    print("\n  vs oracle vLLM (TTFT / TPOT / mean latency):")
+    for d, m in rows.items():
+        if d != "vllm":
+            print(f"  {d:>13}: {100 * (m['ttft'] - o['ttft']) / o['ttft']:+5.0f}% /"
+                  f" {100 * (m['tpot'] - o['tpot']) / o['tpot']:+5.0f}% /"
+                  f" {100 * (m['mean'] - o['mean']) / o['mean']:+5.0f}%")
 
     print("\nCompare these numbers to the synthetic-workload numbers in each")
     print("phase's own docstring. Large divergence = our synthetic workload")

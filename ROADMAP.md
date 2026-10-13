@@ -233,7 +233,11 @@ When memory is **idle**, it *prefetches* (swaps in likely-next LoRAs/KV). When
 ELORA's ablations: replace the cost model with plain LRU (ELORA-WOS) → **1.42×
 worse TTFT**. Drop individual terms (WOL/WOC/WOV/WOU) → 1.19–1.25× worse each.
 
-### Model design (`phase7_cost_swapper.py`)
+### Model design (`phase7_cost_swapper.py`, now `archive/phase7_heuristic_swapper.py`)
+
+> Superseded 2026-10-11 by `phase7_elora.py`, which implements ELORA as the
+> paper specifies (see README, Phase 7, and `ELORA_ALIGNMENT.md`). The design
+> notes below describe the archived heuristic version.
 
 Reuse phase 5's step loop + phase 6's tree. Add:
 
@@ -273,7 +277,7 @@ class CostModelSwapper:
 - if it doesn't reproduce: say so, and name the workload feature we're missing
   (most likely the Azure-trace burstiness — see below)
 
-### Status: DONE — `phase7_cost_swapper.py`
+### Status: DONE, then SUPERSEDED — archived as `archive/phase7_heuristic_swapper.py`
 
 Result: the timer-driven swapper is **net-negative at our engine model**
 (sync swap, charged prefetch, proactive evict-at-92%): −5% to −22% p50, worse

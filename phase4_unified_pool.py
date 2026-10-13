@@ -17,34 +17,45 @@ WHY IT MATTERS: in phases 2-3 each pool had fixed, independent capacity, so
 QUESTION: once the pools are unified, how much does the eviction decision
        actually buy, and which part of the "smart" logic is doing the work?
 
-FINDING (operating points scale with the ~2.7GB working set):
+EXECUTION MODEL -- a toy: pick one adapter, run its whole queue as one
+       batch, move on. Real servers batch continuously (phase 5). Keep this
+       phase as the simplest place to see the "which TYPE to evict" choice,
+       not as a latency prediction (p95 here is ~10 s of queueing that a
+       continuous batcher would not have).
 
-         pool MB   policy       p50    stale KV
-           3600    separate    1052      0.0%     (fits everything)
-           3600    kv-first    1052      0.0%
-           3600    joint       1052      0.0%
-           2500    separate    1053      2.2%
-           2500    kv-first    1052      0.0%
-           2500    joint       1052      0.0%
-           1600    separate    1127     21.9%     (constant eviction)
-           1600    kv-first    1045      0.0%
-           1600    joint       1045      0.0%
+POLICIES (all in the SAME unified pool; only the eviction order differs):
+  adapter-first : two LRUs, adapters freed before KV. Printed as "separate"
+                  in earlier versions -- it never meant separate pools.
+  kv-first      : the same two LRUs, KV freed before adapters.
+  joint         : KV of evicted adapters first, then cold KV, then the
+                  adapter that would orphan the fewest conversations.
 
-       At the packed operating point: unification + KV-before-adapters
-       ordering gives -7.3% p50 and drives staleness to zero. kv-first
-       (crude ordering) == joint (full dependency-aware) exactly. The
-       orphan-count and stale-priority refinements never get exercised.
+FINDING (mean of 5 seeds; p50 = median end-to-end request latency, ms):
 
-       Phase 5 sharpens this under continuous batching + a squeezed unified
-       pool: kv-first there beats even the dependency-aware policy, because
-       the "smart" policy preserves KV it should have dropped.
+  original workload (no user prompts; KV per conversation ~25 MB):
+         pool MB   adapter-first   kv-first   joint    stale KV (adapter-first)
+           3600        1052          1052      1052       0.0%
+           2500        1053          1052      1052       2.2%
+           1600        1127          1045      1045      21.9%   -> -7.3%
 
-       SO: unification is the enabler; ordering discipline captures the
-       benefit; dependency scoring adds nothing here. Whether it adds
-       something once prefixes are SHARED (ELORA's regime) is phase 6 --
-       ELORA's own ELORA-WOM ablation says it should (1.51x TTFT).
+  with real-sized prompts (--input-tokens 600; KV per conversation ~400 MB):
+         pool MB   adapter-first   kv-first   joint    stale KV (adapter-first)
+          20000        1781          1781      1781       0.0%
+          12000        1845          1781      1781      12.6%   -> -3.5%
+           8000        2054          1799      1799      28.2%   -> -12.4%
+           5000        2567          1963      1963      43.3%   -> -23.5%
+          (p95 at 5000 MB: kv-first 22.4 s vs adapter-first 16.5 s -- the
+           tail gets worse while the median improves)
+
+  READING: in a unified pool, evicting KV before adapters wins, and wins
+  MORE with realistic prompts. Rebuilding one big conversation (3,000
+  tokens x 0.15 ms = ~450 ms) can cost more than one adapter reload
+  (300 ms), but an adapter is shared: evicting it charges a reload to the
+  next batch of EVERY conversation using it and strands all their KV.
+  kv-first == joint exactly: the dependency logic never changes a decision.
 
 Run:  python phase4_unified_pool.py
+      python phase4_unified_pool.py --input-tokens 600 --pools 20000 12000 8000 5000
 """
 
 
@@ -128,8 +139,9 @@ class BasePolicy:
 class SeparatePolicy(BasePolicy):
     """The baseline: two independent LRUs that never consult each other.
     Frees adapters first, then KV. Each rule is locally sensible; the failure
-    is that they do not coordinate."""
-    name = "separate"
+    is that they do not coordinate. (Named "separate" in earlier output: it
+    runs in the SAME unified pool -- only its two LRUs are separate.)"""
+    name = "adapter-first"
 
     def choose_evictions(self, cache, needed_mb, prot_a, prot_kv):
         ev, freed = [], 0
@@ -234,9 +246,10 @@ class Simulator:
 
     def grow(self, r, prot_a):
         convo = self.convos[r.conversation_id]
-        convo.grow_cache(r.output_tokens)
+        new_tokens = r.input_tokens + r.output_tokens
+        convo.grow_cache(new_tokens)
         if self.cache.is_resident_kv(r.conversation_id):
-            delta = r.output_tokens * MB_PER_TOKEN
+            delta = new_tokens * MB_PER_TOKEN
             self.make_room(delta, prot_a, r.conversation_id)
             if self.cache.can_fit(delta):
                 self.cache.conversations[r.conversation_id]["size_mb"] = \
@@ -260,9 +273,10 @@ class Simulator:
             self.recompute_tokens += recompute
 
             mx = max(r.output_tokens for r in batch)
+            new_prompt = sum(r.input_tokens for r in batch)
             duration = (25 + len(batch) * 2
                         + mx * DECODE_MS_PER_TOKEN
-                        + recompute * PREFILL_MS_PER_TOKEN
+                        + (recompute + new_prompt) * PREFILL_MS_PER_TOKEN
                         + (self.swap_cost if swapped else 0))
             self.now += duration
             for r in batch:
@@ -287,15 +301,17 @@ OPERATING_POINTS = [
 SEEDS = 5
 
 
-def trial(capacity_mb, PolicyCls, seed):
+def trial(capacity_mb, PolicyCls, seed, mean_input_tokens=0):
     convos, reqs = make_multi_turn_workload(n_conversations=40, n_adapters=12,
                                             turns_per_convo=5, mean_tokens=40,
-                                            rate=0.0006, turn_gap=6000, seed=seed)
+                                            rate=0.0006, turn_gap=6000, seed=seed,
+                                            mean_input_tokens=mean_input_tokens)
     sim = Simulator(reqs, convos, UnifiedCache(capacity_mb), PolicyCls())
     done = sim.run()
     lats = [r.latency() for r in done]
     stale = sum(sim.stale_samples) / len(sim.stale_samples) if sim.stale_samples else 0.0
-    return percentile(lats, 50), percentile(lats, 95), sim.swaps, stale
+    return (percentile(lats, 50), percentile(lats, 95), sim.swaps, stale,
+            sim.recompute_tokens)
 
 
 class SeparateKVFirst(BasePolicy):
@@ -317,23 +333,36 @@ class SeparateKVFirst(BasePolicy):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input-tokens", type=float, default=0.0,
+                    help="mean NEW user-prompt tokens per turn (0 = original "
+                         "zero-prompt workload)")
+    ap.add_argument("--pools", type=int, nargs="+", default=None,
+                    help="pool sizes in MB (default: the three operating points)")
+    args = ap.parse_args()
+    points = ([(f"{c} MB", c) for c in args.pools] if args.pools
+              else OPERATING_POINTS)
+
     print(__doc__)
-    print(f"{'operating point':>22} {'pool':>6} {'policy':>10} {'p50':>8} {'p95':>9}"
-          f" {'swaps':>7} {'stale KV':>9}")
-    print("-" * 78)
-    for label, cap in OPERATING_POINTS:
+    print(f"input tokens/turn (mean): {args.input_tokens:.0f}\n")
+    print(f"{'operating point':>22} {'pool':>6} {'policy':>13} {'p50':>8} {'p95':>9}"
+          f" {'swaps':>7} {'stale KV':>9} {'rebuild s':>10}")
+    print("-" * 92)
+    for label, cap in points:
         res = {}
         for P in [SeparatePolicy, SeparateKVFirst, JointPolicy]:
-            vals = [trial(cap, P, s) for s in range(SEEDS)]
+            vals = [trial(cap, P, s, args.input_tokens) for s in range(SEEDS)]
             p50 = sum(v[0] for v in vals) / SEEDS
             p95 = sum(v[1] for v in vals) / SEEDS
             sw = sum(v[2] for v in vals) / SEEDS
             st = sum(v[3] for v in vals) / SEEDS
+            rb = sum(v[4] for v in vals) / SEEDS * PREFILL_MS_PER_TOKEN / 1000
             res[P.name] = p50
-            print(f"{label:>22} {cap:>6} {P.name:>10} {p50:>8.0f} {p95:>9.0f}"
-                  f" {sw:>7.0f} {st:>8.1f}%")
-        win = 100 * (res['separate'] - res['joint']) / res['separate']
-        print(f"{'':>22} {'':>6} {'-> vs adapter-first':>19} {win:>7.1f}%")
+            print(f"{label:>22} {cap:>6} {P.name:>13} {p50:>8.0f} {p95:>9.0f}"
+                  f" {sw:>7.0f} {st:>8.1f}% {rb:>10.1f}")
+        win = 100 * (res['adapter-first'] - res['joint']) / res['adapter-first']
+        print(f"{'':>22} {'':>6} {'-> joint vs adapter-first':>25} {win:>7.1f}%")
         print()
 
 

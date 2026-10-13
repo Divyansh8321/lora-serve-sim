@@ -7,7 +7,80 @@ different traffic will never line up digit-for-digit. The goal was to
 document is that explanation, built on **three independent real datasets**,
 **two of which are literally ELORA's own named evaluation datasets**.
 
-> ## ⚠️ Corrections (post-audit) — read this first
+> ## Update 4 (2026-10-11): phase 7 rebuilt to ELORA's spec, re-run on real data
+>
+> Phase 7 is now `phase7_elora.py` (host-memory KV tier, LoRA-parent tree,
+> Eq. 3–6; see the README). The heuristic `swap-full` / `react-lru` numbers in
+> Correction 3 and Finding 4 come from the archived version
+> (`archive/phase7_heuristic_swapper.py`). On the synthetic chat workload the new
+> phase 7 shows ELORA −21% to −87% TTFT vs an oracle-tuned vLLM, all from the
+> host KV tier. On the real traces (3 windows each, `--hw ours`), change in
+> mean TTFT vs oracle vLLM:
+>
+> | dataset | turn timing | `elora` | `elora-nohost` | `vllm-offload` | `slora` | KV blocks swapped back in (`elora`) |
+> |---|---|---|---|---|---|---|
+> | LMSYS (2,000 convos, 1,500 MB) | as loaded | −2% | −2% | −1% | 0% | 0 |
+> | LMSYS | `--think-ms 15000` | −16% (69 → 58 ms) | −16% | −8% | −11% | 0 |
+> | Taskmaster (2,000 convos, 1,900 MB) | as loaded | 0% | 0% | 0% | +7% | 0 |
+> | Taskmaster | `--think-ms 15000` | −6% | −3% | +1% | +69% | 1,218 |
+> | Mooncake (960 convos, 433 adapters, 11,600 MB, big prompts) | BurstGPT | **+10%** (785 → 864 ms) | +36% | **−30%** (553 ms) | +77% | 6,172 |
+>
+> Oracle vLLM on Mooncake is `max_loras` 60 (TTFT 785 ms; the 0.2-ratio
+> setting, 12, gives 1,067 ms). With 433 adapters, `elora`'s one shared pool
+> keeps pushing adapters out to make room for big KV and reloads them
+> (1,014 adapter loads vs 82 for vLLM ml=60), so it **loses to tuned vLLM**.
+> `vllm-offload` ml=60 — vLLM's fixed adapter slab plus a CPU KV tier — is the
+> best design here by a wide margin. Again the host KV tier is what helps;
+> the unified pool hurts when adapters are many.
+>
+> **Caveat:** the Mooncake pool is auto-sized as 60 adapters + 800 MB
+> (11,600 MB), so vLLM ml=60 leaves only ~800 MB for KV while median prompts
+> are ~6,900 tokens (~860 MB). That memory split is our harness's choice, not
+> a realistic deployment, and it favours a large fixed adapter slab. Treat
+> this row as unconfirmed until rerun with a realistic GPU size.
+>
+> **Why LMSYS and Taskmaster barely separate the designs.** ELORA's win comes from
+> conversations that come back *after* their KV was pushed out of GPU memory.
+> As loaded, LMSYS (one timestamp per conversation) and Taskmaster (no
+> timestamps; our loader spaces turns 1 ms apart) deliver all of a
+> conversation's turns at once, so evicted KV is never needed again ("KV
+> blocks swapped back in" = 0). `--think-ms` adds an *assumed* gap between
+> turns. Even then their turns are tiny (median 16 / 8 new prompt tokens), so
+> recomputing evicted KV is cheap and the host tier has little to save.
+
+> ## ⚠️ Correction 3 (code audit, 2026-10-11) — supersedes the numbers below
+>
+> Phase 6's `lru-leaf` treated a node as a leaf only if it had *no children
+> at all*. Children are never pruned, so **shared prefix nodes could never be
+> evicted**. Every staleness number and every `lru-leaf` latency in this
+> document came from that bug:
+>
+> | measurement | as published | old code, re-run | fixed code |
+> |---|---|---|---|
+> | Taskmaster control, prefix 400, 300 MB | 99.40% stale | **99.40%**, p50 3,752,225 ms | **0.00%**, p50 551 ms |
+> | Mooncake, 960 convos, 11.6 GB, 60 slots | 42.5% stale, `lru-leaf` p50 9.9M ms | — | **0.4%** stale, p50 6,971 ms |
+>
+> The real-trace loaders also **discarded real prompt sizes** (Mooncake's
+> `input_length`, median 6,909 tokens). They now pass the new tokens per turn through
+> (`Request.input_tokens`). Re-run on fixed code (3 real-history windows each):
+>
+> | dataset | phase 6 policies (p50) | `react-lru` → `swap-full` | adapter loads |
+> |---|---|---|---|
+> | Mooncake (433 adapters, 11.6 GB) | 6,971 / 7,018 / 6,967 — all within 1% | 6,977 → 6,985 (**−0.1%**) | 653 → 678 |
+> | Taskmaster, loose (1,900 MB, 6 slots) | — | 241 → 305 (**−26.9%**) | 165 → 310 |
+> | Taskmaster, tight (300 MB, 6 slots) | 491 for all three | 491 → 491 (0%) | 861 → 860 |
+> | LMSYS (6,000 convos, 1,500 MB) | 1,842 / 1,842 / 1,836 | 1,842 → 1,921 (**−4.3%**) | 1,426 → 2,191 |
+>
+> **What stands:** the swapper's proactive-eviction churn costs 27% on Taskmaster
+> and 4% on LMSYS and is neutral on Mooncake (Finding 4, with updated magnitudes).
+> The adapter-population facts (Finding 1) and the `max_loras` sizing fix
+> also stand. **What falls:** every staleness figure and the `lru-leaf`
+> latency collapse. On all three real datasets, *no eviction policy is
+> distinguishable from plain LRU*. The simulator's limits behind that are listed in
+> `ELORA_ALIGNMENT.md` (no host-memory tier, drop-instead-of-swap, our
+> heuristics instead of ELORA's Eq. 3–6).
+
+> ## ⚠️ Corrections 1–2 (earlier self-audit)
 >
 > A self-audit found **two** overstated claims, both now corrected. Together
 > they mean **this document contains no valid measurement of the stale-KV
@@ -106,7 +179,7 @@ actual regime than it was to "real traffic" in general.**
 `--min-adapter-reuse 2` (Mooncake only) restricts to conversations whose
 adapter is used ≥2 times — traffic where a caching decision exists at all.
 
-## Finding 2 (CORRECTED): Mooncake's staleness numbers are a function of our own derived constant, not a measurement
+## Finding 2 (SUPERSEDED by Correction 3 — staleness and `lru-leaf` latencies below were the leaf bug): Mooncake's staleness numbers are a function of our own derived constant, not a measurement
 
 433 real Mooncake adapters, slab sized ~40% of that:
 
@@ -146,7 +219,7 @@ actual variable-depth, per-turn-growing hash chains rather than collapsing
 them — which the current phase 6/7 tree model (one `prefix_tokens` per
 conversation) cannot represent without modification.
 
-## Finding 3 (CORRECTED): what we could and could not measure on ELORA's own datasets
+## Finding 3 (CORRECTED; the 99.40% control below was the leaf bug — see Correction 3): what we could and could not measure on ELORA's own datasets
 
 Taskmaster (15 real adapters) and LMSYS (9-20 real adapters), each swept from
 a loose pool down to the tightest possible squeeze (Taskmaster: 1,900→200 MB,
@@ -189,7 +262,7 @@ prefix-sharing structure *and* real adapter identity. Mooncake has the first;
 Taskmaster and LMSYS have the second; **no dataset we found has both.** That
 is the real blocker, and it is a data-availability limitation, not a finding.
 
-## Finding 4 (the one real-data result that stands): the swapper's proactive eviction hurts on TWO of three real datasets
+## Finding 4 (stands; magnitudes updated in Correction 3: Taskmaster −26.9%, LMSYS −4.3%, Mooncake −0.1%): the swapper's proactive eviction hurts on TWO of three real datasets
 
 | dataset | `react-lru` p50 | `swap-full` p50 | delta | adapter loads (react-lru → swap-full) |
 |---|---|---|---|---|
